@@ -121,7 +121,13 @@ impl Made {
     }
 }
 
+static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 pub(crate) struct HostHeap {
+    /// Identity of this host heap instance, checked by [`HostHeap::release`] so a stale
+    /// list resetting after a title heap was replaced at the same address does
+    /// not free slots belonging to the new heap (fxceless #1324, VIctory-NVIDIA 47747d6).
+    id: u64,
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
     step: u32,
@@ -1671,6 +1677,7 @@ impl HostHeap {
             })
             .flatten();
         let h = HostHeap {
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             heap,
             cpu,
             step,
@@ -2755,11 +2762,19 @@ impl HostHeap {
         stale
     }
 
+    /// Identity of this host heap instance (see [`HostHeap::release`]).
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
-    /// returned).
+    /// returned), only if `id` matches this host heap.
     ///
     /// [`dynamic`]: HostHeap::dynamic
-    pub(crate) fn release(&self, first: u32, n: u32) {
+    pub(crate) fn release(&self, id: u64, first: u32, n: u32) {
+        if id != self.id {
+            return;
+        }
         let Some(at) = first.checked_sub(self.count) else {
             return;
         };
@@ -6110,7 +6125,7 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         assert_eq!((a, b), (4 + 100, 4));
         // 40 left between them: 50 do not fit until something is given back.
         assert_eq!(heap.dynamic(50), None);
-        heap.release(a, 50);
+        heap.release(heap.id(), a, 50);
         assert_eq!(heap.dynamic(50), Some(a));
         assert_eq!(heap.dynamic(40), Some(4 + 60));
     }
@@ -6138,9 +6153,9 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         assert_eq!(long, end - 258);
         let short: Vec<u32> = (0..1000).map(|_| heap.dynamic(7).unwrap()).collect();
         assert_eq!((short[0], short[999]), (4, 4 + 999 * 7));
-        heap.release(long, 258);
+        heap.release(heap.id(), long, 258);
         for &s in short.iter().step_by(2) {
-            heap.release(s, 7);
+            heap.release(heap.id(), s, 7);
         }
         // another length: no run kept for it, and the short tables left it room at the end
         assert_eq!(heap.dynamic(300), Some(end - 300));
@@ -6161,13 +6176,13 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         let b = heap.dynamic(5).unwrap();
         let c = heap.dynamic(27).unwrap();
         assert_eq!((a, b, c), (4, 31, 36));
-        heap.release(a, 27);
+        heap.release(heap.id(), a, 27);
         // the same run, though the search would start past `c`
         assert_eq!(heap.dynamic(27), Some(a));
         // the rest of the pool taken: the search starts from the first slot again
         assert_eq!(heap.dynamic(heap.dynamic - 59), Some(63));
-        heap.release(a, 27);
-        heap.release(b, 5);
+        heap.release(heap.id(), a, 27);
+        heap.release(heap.id(), b, 5);
         // a longer table takes most of both runs: their entries are stale
         assert_eq!(heap.dynamic(30), Some(4));
         assert_eq!(heap.dynamic(27), None);
@@ -6184,21 +6199,39 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         // every other pair of slots taken: plenty free, no run of three
         let all = heap.dynamic(heap.dynamic).unwrap();
         for k in (0..heap.dynamic - 1).step_by(4) {
-            heap.release(all + k, 2);
+            heap.release(heap.id(), all + k, 2);
         }
         heap.too_long.store(u32::MAX, Relaxed);
         heap.spare.lock().unwrap().clear();
         assert_eq!(heap.dynamic(3), None);
         assert_eq!(heap.too_long.load(Relaxed), 3);
         // a slot given back elsewhere does not start the search again
-        heap.release(all + 2, 1);
+        heap.release(heap.id(), all + 2, 1);
         assert_eq!(heap.too_long.load(Relaxed), 3);
         // (it made a run of three there: found once enough has come back)
         for k in (6..heap.dynamic - 1).step_by(4).take((heap.dynamic / RETRY_AFTER) as usize) {
-            heap.release(all + k, 1);
+            heap.release(heap.id(), all + k, 1);
         }
         assert_eq!(heap.too_long.load(Relaxed), u32::MAX);
         assert_eq!(heap.dynamic(3), Some(all));
+    }
+
+    #[test]
+    fn dynamic_slots_are_given_back_only_to_the_heap_that_took_them() {
+        let (Some(a), Some(b)) = (HostHeap::new(false, 4), HostHeap::new(false, 4)) else {
+            return; // no host GPU
+        };
+        assert_ne!(a.id(), b.id());
+        let first = a.dynamic(2).unwrap();
+        let after_alloc = a.free.load(std::sync::atomic::Ordering::Relaxed);
+        a.release(b.id(), first, 2);
+        assert_eq!(
+            a.free.load(std::sync::atomic::Ordering::Relaxed),
+            after_alloc,
+            "releasing with another heap's identity must not free slots"
+        );
+        a.release(a.id(), first, 2);
+        assert_eq!(a.free.load(std::sync::atomic::Ordering::Relaxed), after_alloc + 2);
     }
 
     #[test]
@@ -6214,17 +6247,17 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         assert_eq!((first, left, right, rest), (4, 5, 7, 9));
 
         // Reallocating the left half puts the cursor back in the middle.
-        heap.release(left, 2);
+        heap.release(heap.id(), left, 2);
         assert_eq!(heap.dynamic(2), Some(left));
-        heap.release(left, 2);
-        heap.release(right, 2);
+        heap.release(heap.id(), left, 2);
+        heap.release(heap.id(), right, 2);
         assert_eq!(heap.dynamic(4), Some(left));
         assert_eq!(heap.dynamic(1), None);
 
         // A free slot at each physical end does not form a two-slot range.
-        heap.release(first, 1);
+        heap.release(heap.id(), first, 1);
         let last = first + heap.dynamic - 1;
-        heap.release(last, 1);
+        heap.release(heap.id(), last, 1);
         assert_eq!(heap.dynamic(2), None);
     }
 }
