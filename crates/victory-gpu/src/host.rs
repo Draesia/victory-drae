@@ -9250,6 +9250,15 @@ impl Meter {
                      hold still (the runtime remapping it); the rest is reading, hashing and detiling"
                 );
             }
+            if crate::texture::live_verify() {
+                let [hot, found, rearmed, skipped] =
+                    [0, 1, 2, 3].map(|i| crate::texture::LIVE_COUNTS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+                tracing::info!(
+                    "live textures per frame (VICTORY_TEXTURE_LIVE=verify): {hot:.1} checks hashed only because hot, \
+                     {found:.1} of them found a change; {rearmed:.1} made hot again by a change the blind rule alone \
+                     would have left cold; {skipped:.1} checks passed over unhashed of a texture changed lately"
+                );
+            }
             let [through, left, filled, short] =
                 [0, 1, 2, 3].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
             let first_waits = crate::texture::FIRST_FILL_WAITS.load(Ordering::Relaxed);
