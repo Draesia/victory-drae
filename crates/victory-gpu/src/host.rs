@@ -9190,7 +9190,14 @@ impl Meter {
         // Over the same frames as the counts above.
         #[cfg(feature = "diagnostics")]
         let drops = crate::pipeline::take_drops();
-        if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
+        // `VICTORY_FRAME_LINE_MS`: how often the frame-rate line and its
+        // details are logged (default 5000 ms, at least 250).
+        static EVERY: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+        let every = *EVERY.get_or_init(|| {
+            let ms = std::env::var("VICTORY_FRAME_LINE_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(5000);
+            std::time::Duration::from_millis(ms.max(250))
+        });
+        if self.logged.elapsed() >= every {
             self.logged = std::time::Instant::now();
             tracing::info!(
                 "placed texture views: {} writes of another view of the texture a slot showed (it kept the old view until the new was made)",
