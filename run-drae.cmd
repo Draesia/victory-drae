@@ -35,6 +35,10 @@ rem                            (27/11, diag frame 2697): the title's tile lists 
 rem                            940c2635dc1312f4 ask for up to ~67,000 groups (one per 8x4 tile); cut to
 rem                            65,535 the lowest tiles are never drawn (indirect.rs widest()). On by
 rem                            default on AMD only; untested on NVIDIA (could lose the device).
+rem   run-corgi.cmd pool4      VICTORY_WIDE_THREADS=4 (pool1-6, pool8): threads kept for the host's
+rem                            wide work. Default here is 2 (8 threads / 4); with the submitting thread
+rem                            3 do a submission's refreshes, 27.6 ms of work in 11.9 ms (27/11, 174700).
+rem                            Log name gets -poolN. No re-warm.
 rem   run-corgi.cmd diag       the diagnostics build with the in-game debugger (see near the end)
 rem   run-corgi.cmd novol      VICTORY_SKIP_PIPELINES for the water's transmission volumetrics
 rem                            (5dc3b25986622949 _Tiled, 6f225b641c5b0708 _Tiled_LocalLights,
@@ -200,6 +204,7 @@ if /i "%~1"=="diag"        set "A_DIAG=1"
 if /i "%~1"=="wide"        set "VICTORY_INDIRECT_WIDE=force"
 if /i "%~1"=="trace"       set "A_TRACE=1"
 if /i "%~1"=="novol"       set "A_NOVOL=1"
+for %%N in (1 2 3 4 5 6 8) do if /i "%~1"=="pool%%N" set "VICTORY_WIDE_THREADS=%%N"
 shift
 goto args
 :argsdone
@@ -322,6 +327,7 @@ if defined A_TRACE set "TAG=%TAG%-trace"
 if defined A_NOVOL set "VICTORY_SKIP_PIPELINES=5dc3b25986622949,6f225b641c5b0708,a10179ab7eda0dc3"
 if defined A_NOVOL set "TAG=%TAG%-novol"
 if defined VICTORY_INDIRECT_WIDE set "TAG=%TAG%-wide"
+if defined VICTORY_WIDE_THREADS set "TAG=%TAG%-pool%VICTORY_WIDE_THREADS%"
 if defined VICTORY_QUICK_FIND_SLOTS set "TAG=%TAG%-slots%VICTORY_QUICK_FIND_SLOTS%"
 for /f "tokens=1-3 delims=:., " %%a in ("%TIME%") do set "STAMP=%%a%%b%%c"
 set "STAMP=%STAMP: =0%"

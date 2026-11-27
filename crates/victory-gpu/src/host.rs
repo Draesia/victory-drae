@@ -7877,6 +7877,58 @@ static STEP_SPLIT: [std::sync::atomic::AtomicU64; 14] = [const { std::sync::atom
 /// those known to copy nothing, and those done on several threads.
 static FLUSHES: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
+/// Since the last frame-rate line, the refresh flushes ([`Batch::refresh_front`],
+/// [`Batch::flush_all`]) in their parts, for [`refreshes_line`]. Always on: the
+/// profile of 27/11 put 12-16 ms a frame of the critical path in refreshes,
+/// 8.5k of 9.9k of them copying nothing, and could not say where it went.
+/// 0 flushes, 1 their refreshes, 2 ns gathering them (front), 3 ns told
+/// nothing new on the submitting thread, 4 ns asking ahead, 5-6 its kernel
+/// askings and ns, 7 ns on the threads (wall), 8 ns of nothing-new checks
+/// there (summed), 9 ns of updates (summed), 10-11 their kernel askings and
+/// ns, 12 flushes over [`FEW_REFRESHES`], 13 their refreshes, 14 ns of
+/// textures (summed), 15 updates.
+static REFRESHES: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::AtomicU64::new(0) }; 16];
+
+/// At most this many refreshes in a flush are told nothing new on the
+/// submitting thread; more are told so on the threads.
+const FEW_REFRESHES: usize = 256;
+
+fn refreshes_add(i: usize, n: u64) {
+    REFRESHES[i].fetch_add(n, Ordering::Relaxed);
+}
+
+/// For the frame-rate line: where the refreshes of [`preparing_line`] go.
+fn refreshes_line(frames: f64) {
+    let r: Vec<f64> = REFRESHES.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    if r[0] == 0.0 {
+        return;
+    }
+    let ms = |i: usize| r[i] / 1e6;
+    tracing::info!(
+        "refresh flushes per frame: {:.0} flushes of {:.0} refreshes ({:.0} flushes over {} with {:.0}); on the submitting thread \
+         {:.2} ms gathering them, {:.2} telling nothing new, {:.2} asking ahead in {:.0} kernel askings ({:.2} ms of them); \
+         on the threads {:.2} ms as it took: nothing-new checks {:.2} ms summed, {:.0} updates {:.2} ms summed with {:.0} \
+         kernel askings ({:.2} ms of them), textures {:.2} ms summed",
+        r[0],
+        r[1],
+        r[12],
+        FEW_REFRESHES,
+        r[13],
+        ms(2),
+        ms(3),
+        ms(4),
+        r[5],
+        ms(6),
+        ms(7),
+        ms(8),
+        r[15],
+        ms(9),
+        r[10],
+        ms(11),
+        ms(14),
+    );
+}
+
 /// Counts into [`SPLIT`].
 struct Split(std::cell::Cell<std::time::Instant>);
 
@@ -8340,6 +8392,39 @@ impl Batch {
         }
     }
 
+    /// One refresh of a flush, on whichever thread: told nothing new first
+    /// if `check`, else brought up to date; timed into [`REFRESHES`].
+    fn refresh_one(shadow: &crate::shadow::Shadow, from: usize, to: usize, check: bool) {
+        let began = std::time::Instant::now();
+        if check {
+            let same = shadow.nothing_new(from, to - from);
+            refreshes_add(8, began.elapsed().as_nanos() as u64);
+            if same {
+                FLUSHES[2].fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
+        let (calls, ns) = crate::watch::kernel_calls();
+        let updating = std::time::Instant::now();
+        Self::update(shadow, from, to);
+        refreshes_add(9, updating.elapsed().as_nanos() as u64);
+        refreshes_add(15, 1);
+        let (calls_now, ns_now) = crate::watch::kernel_calls();
+        refreshes_add(10, calls_now - calls);
+        refreshes_add(11, ns_now - ns);
+    }
+
+    /// [`crate::watch::ask_ahead`] of `ranges`, timed into [`REFRESHES`].
+    fn ask_ahead_timed(ranges: &[(usize, usize)]) {
+        let began = std::time::Instant::now();
+        let (calls, ns) = crate::watch::kernel_calls();
+        crate::watch::ask_ahead(ranges);
+        let (calls_now, ns_now) = crate::watch::kernel_calls();
+        refreshes_add(4, began.elapsed().as_nanos() as u64);
+        refreshes_add(5, calls_now - calls);
+        refreshes_add(6, ns_now - ns);
+    }
+
     /// Brings `[from, to)` of a copy up to date, timed.
     fn update(shadow: &crate::shadow::Shadow, from: usize, to: usize) {
         let started = std::time::Instant::now();
@@ -8369,6 +8454,7 @@ impl Batch {
     /// Before the steps of `runs` ([`refresh_front`]), a new part of the
     /// submission beginning at each of `parts`.
     fn refresh_front(&mut self, runs: &[&HostList], parts: &[usize]) {
+        let gathering = std::time::Instant::now();
         let mut copies: ByCopy<std::sync::Arc<crate::shadow::Shadow>> = ByCopy::default();
         let mut due = Vec::new();
         let mut touches = Vec::new();
@@ -8408,39 +8494,46 @@ impl Batch {
         {
             FLUSHES[0].fetch_add(1, Ordering::Relaxed);
             FLUSHES[1].fetch_add(spans.len() as u64, Ordering::Relaxed);
+            refreshes_add(0, 1);
+            refreshes_add(1, spans.len() as u64);
+            refreshes_add(2, gathering.elapsed().as_nanos() as u64);
         }
         let _flush = crate::timeline::span("refreshes of copies");
         let started = std::time::Instant::now();
         let before = [0, 2].map(|i| PREPARING[i].load(Ordering::Relaxed));
         // Those known to copy nothing are said so here, unless they are very
         // many: then beside the others.
-        const FEW: usize = 256;
         let mut spans = spans;
-        let many = spans.len() > FEW;
-        if !many {
+        let many = spans.len() > FEW_REFRESHES;
+        if many {
+            refreshes_add(12, 1);
+            refreshes_add(13, spans.len() as u64);
+        } else {
+            let telling = std::time::Instant::now();
             let all = spans.len();
             spans.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
             FLUSHES[2].fetch_add((all - spans.len()) as u64, Ordering::Relaxed);
+            refreshes_add(3, telling.elapsed().as_nanos() as u64);
         }
         let ahead = spans.len() > 1;
         if ahead {
             let ranges: Vec<(usize, usize)> = spans.iter().filter(|r| r.0.asked_ahead()).map(|r| (r.1, r.2)).collect();
-            crate::watch::ask_ahead(&ranges);
+            Self::ask_ahead_timed(&ranges);
         }
         FLUSHES[3].fetch_add(spans.len() as u64, Ordering::Relaxed);
+        let threads = std::time::Instant::now();
         crate::shadow::wide_each(spans.len() + due.len(), move |i| {
             // The textures first: they are the longer pieces.
             let Some(i) = i.checked_sub(due.len()) else {
+                let began = std::time::Instant::now();
                 due[i].refresh();
+                refreshes_add(14, began.elapsed().as_nanos() as u64);
                 return;
             };
             let (shadow, from, to) = &spans[i];
-            if many && shadow.nothing_new(*from, *to - *from) {
-                FLUSHES[2].fetch_add(1, Ordering::Relaxed);
-                return;
-            }
-            Self::update(shadow, *from, *to);
+            Self::refresh_one(shadow, *from, *to, many);
         });
+        refreshes_add(7, threads.elapsed().as_nanos() as u64);
         if ahead {
             crate::watch::ask_ahead_done();
         }
@@ -8562,14 +8655,21 @@ impl Batch {
         // from what the submission's asking found, before anything is asked
         // and any thread woken. (Thousands of them, the heap's buffer views
         // once a frame: on the threads, below.)
-        const FEW: usize = 256;
+        const FEW: usize = FEW_REFRESHES;
         let light = crate::watch::light();
+        refreshes_add(0, 1);
+        refreshes_add(1, self.refreshes.len() as u64);
+        if self.refreshes.len() > FEW {
+            refreshes_add(12, 1);
+            refreshes_add(13, self.refreshes.len() as u64);
+        }
         if light && self.refreshes.len() <= FEW {
             let started = std::time::Instant::now();
             let all = self.refreshes.len();
             self.refreshes.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             FLUSHES[2].fetch_add((all - self.refreshes.len()) as u64, Ordering::Relaxed);
+            refreshes_add(3, started.elapsed().as_nanos() as u64);
         }
         // One write-watch asking for the copies that lie close together,
         // not one per copy.
@@ -8582,9 +8682,10 @@ impl Batch {
                 .filter(|r| r.0.asked_ahead())
                 .map(|r| (r.1, r.2))
                 .collect();
-            crate::watch::ask_ahead(&ranges);
+            Self::ask_ahead_timed(&ranges);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
+        let threads = std::time::Instant::now();
         if wide_refresh() && self.refreshes.len() >= 4 {
             // Each copy on its own, several at a time: a copy's refresh
             // writes that copy and reads title memory, nothing of another's.
@@ -8597,11 +8698,7 @@ impl Batch {
                 let refreshes = std::mem::take(&mut self.refreshes);
                 crate::shadow::wide_each(refreshes.len(), move |i| {
                     let (shadow, from, to) = &refreshes[i];
-                    if refreshes.len() > FEW && shadow.nothing_new(*from, *to - *from) {
-                        FLUSHES[2].fetch_add(1, Ordering::Relaxed);
-                        return;
-                    }
-                    Self::update(shadow, *from, *to);
+                    Self::refresh_one(shadow, *from, *to, refreshes.len() > FEW);
                 });
             } else {
                 let jobs: Vec<Box<dyn FnOnce() + Send>> = self
@@ -8615,9 +8712,10 @@ impl Batch {
             PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
         } else {
             for (shadow, from, to) in self.refreshes.drain(..) {
-                Self::update(&shadow, from, to);
+                Self::refresh_one(&shadow, from, to, false);
             }
         }
+        refreshes_add(7, threads.elapsed().as_nanos() as u64);
         if ahead {
             crate::watch::ask_ahead_done();
         }
@@ -9127,6 +9225,7 @@ impl Meter {
         crate::shadow::back_line(frames);
         crate::shadow::windows_line(frames);
         preparing_line(frames);
+        refreshes_line(frames);
         #[cfg(feature = "diagnostics")]
         split_line(frames);
         {

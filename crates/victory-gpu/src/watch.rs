@@ -240,6 +240,14 @@ impl Drop for Asking {
 thread_local! {
     /// Room for the kernel's answer.
     static FOUND: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// This thread's kernel askings so far, and their nanoseconds ([`kernel_calls`]).
+    static CALLS: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// This thread's kernel askings (`GetWriteWatch`) so far, and their
+/// nanoseconds: what a piece of work asked is the difference across it.
+pub(crate) fn kernel_calls() -> (u64, u64) {
+    CALLS.with(|c| c.get())
 }
 
 /// The pages of `[first, last)` the kernel says were written since it was
@@ -255,7 +263,6 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
             found.resize(count, 0);
         }
         let mut granularity = 0;
-        #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         // SAFETY: the answer buffer holds `count` entries.
         let failed = unsafe {
@@ -268,6 +275,10 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
                 &mut granularity,
             )
         } != 0;
+        CALLS.with(|c| {
+            let (n, ns) = c.get();
+            c.set((n + 1, ns + started.elapsed().as_nanos() as u64));
+        });
         #[cfg(feature = "diagnostics")]
         {
             tally(10, u64::from(failed));

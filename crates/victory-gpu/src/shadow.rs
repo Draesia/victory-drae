@@ -1698,9 +1698,19 @@ fn spin(there: impl Fn() -> bool) {
     }
 }
 
-/// How many threads are kept for [`wide`].
+/// How many threads are kept for [`wide`] (`VICTORY_WIDE_THREADS=<n>`, 1 to
+/// 16; else a quarter of the machine's, 2 to 6).
+///
+/// On an 8-thread machine that is 2, and with the submitting thread 3 do a
+/// submission's refreshes: in session 174700 (27/11) they were 27.6 ms of work
+/// a frame done in 11.9 ms, on the critical path, while the process used 5.2
+/// of the 8.
 fn wide_threads() -> usize {
-    std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6)
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        let default = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6);
+        std::env::var("VICTORY_WIDE_THREADS").ok().and_then(|v| v.trim().parse::<usize>().ok()).map_or(default, |n| n.clamp(1, 16))
+    })
 }
 
 fn workers() -> &'static Workers {
@@ -1712,6 +1722,7 @@ fn workers() -> &'static Workers {
         there: std::sync::atomic::AtomicUsize::new(0),
     });
     STARTED.call_once(|| {
+        tracing::info!("threads kept for the host's wide work (refreshes, merges): {} (VICTORY_WIDE_THREADS)", wide_threads());
         for i in 0..wide_threads() {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
                 crate::cores::keep_helper_on_fast_cores("victory-wide");
