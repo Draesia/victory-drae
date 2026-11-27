@@ -58,9 +58,9 @@ rem   run-corgi.cmd rt-open    as rt, but builder stores DO reach title memory (
 rem   run-corgi.cmd lowram     without VICTORY_CARD_ALL/FETCH_CHECK: SLOWER typical frame (97 vs
 rem                            72 ms) but NO STUTTER (0%% of frames spiked, against 21%%)
 rem   run-corgi.cmd thin0      VICTORY_THIN=0, the value play-highram.ps1 means to set but cannot
-rem   run-corgi.cmd video      intro video plays right: VICTORY_TEXTURE_GUARD=0, JOIN_PARTS=0,
-rem                            TEXTURE_NO_WAIT=0 (the guard misses the video ring, JOIN_PARTS repeats
-rem                            frames, NO_WAIT reads it stale). Textures cost more per frame.
+rem   run-corgi.cmd video      intro video plays right: VICTORY_TEXTURE_LIVE=1, JOIN_PARTS=1 (the
+rem                            guard leaves the video ring cold after a non-blind change; JOIN_PARTS=8
+rem                            repeats frames). The guard stays on: textures stay cheap.
 rem   run-corgi.cmd bar        put title memory windows straight in card memory over the
 rem                            resizable BAR: no CPU-side copy, no send, no change list
 rem   run-corgi.cmd upscaler   WITH the title's own temporal upscaler (VICTORY_OWN_UPSCALER=1). Off by
@@ -296,7 +296,7 @@ rem longer you played. THIN=0 costs about 1.5 fps. Pass "thin0" to try it.
 if defined A_THIN0 set "VICTORY_THIN=0"
 
 rem --- intro video fix, on request ("video"): after the block above, so its JOIN_PARTS is overridden.
-if defined A_VIDEO set "VICTORY_TEXTURE_GUARD=0" & set "VICTORY_JOIN_PARTS=0" & set "VICTORY_TEXTURE_NO_WAIT=0"
+if defined A_VIDEO set "VICTORY_TEXTURE_LIVE=1" & set "VICTORY_JOIN_PARTS=1"
 
 rem --- the game's real ray-traced indirect light, on request
 if defined A_RT set "VICTORY_BVH_BUILDER=1"
