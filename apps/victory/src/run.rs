@@ -63,6 +63,14 @@ pub fn run(
     let asked = victory_hle::streamline::Asked::from_env().map_err(anyhow::Error::msg)?;
     let available = victory_hle::streamline::init(&asked);
     let upscaler = (available.dlss || available.framegen).then_some(asked.mode);
+    // corgi: VICTORY_OWN_UPSCALER keeps the title on renderer 6 (its own
+    // temporal pass) by the same instruction `prepare_upscaler` makes pick
+    // renderer 7, so with DLSS or frame generation it is let go of.
+    if upscaler.is_some() && std::env::var_os("VICTORY_OWN_UPSCALER").is_some_and(|v| v != "0") {
+        // SAFETY: nothing else runs yet; the loader reads it at mapping.
+        unsafe { std::env::remove_var("VICTORY_OWN_UPSCALER") };
+        println!("upscaling      VICTORY_OWN_UPSCALER left out: DLSS takes the title's FidelityFX path instead");
+    }
     if asked.any() {
         println!(
             "upscaling      DLSS {}, frame generation {}{}",
