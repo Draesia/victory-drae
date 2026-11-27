@@ -9230,10 +9230,12 @@ impl Meter {
         split_line(frames);
         {
             let [passes, pieces, compares] = [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
-            if passes + compares > 0.0 {
+            let wc_left = crate::shadow::WC_LEFT.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames;
+            if passes + compares + wc_left > 0.0 {
                 tracing::info!(
                     "our passes over copies in the card's memory per frame: {passes:.0} hash passes over {pieces:.0} pieces after \
-                     ranges were sent up (VICTORY_CARD_REHASH_RUNS=1 joins them: now {}), {compares:.0} compare passes",
+                     ranges were sent up (VICTORY_CARD_REHASH_RUNS=1 joins them: now {}), {compares:.0} compare passes; \
+                     {wc_left:.1} MB declared written in write-combined memory left on the card (VICTORY_WC_NO_BACK)",
                     if rehash_runs() { "on" } else { "off" }
                 );
             }
@@ -9289,7 +9291,14 @@ impl Meter {
         // Over the same frames as the counts above.
         #[cfg(feature = "diagnostics")]
         let drops = crate::pipeline::take_drops();
-        if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
+        // `VICTORY_FRAME_LINE_MS`: how often the frame-rate line and its
+        // details are logged (default 5000 ms, at least 250).
+        static EVERY: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+        let every = *EVERY.get_or_init(|| {
+            let ms = std::env::var("VICTORY_FRAME_LINE_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(5000);
+            std::time::Duration::from_millis(ms.max(250))
+        });
+        if self.logged.elapsed() >= every {
             self.logged = std::time::Instant::now();
             tracing::info!(
                 "placed texture views: {} writes of another view of the texture a slot showed (it kept the old view until the new was made)",

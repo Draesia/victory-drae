@@ -33,6 +33,12 @@
 //! The air of a room is lit by the same probes: without rays they hold the
 //! sky's light indoors too, a brown veil at sunset. `VICTORY_AMBIENT_AIR`
 //! bounds what the air scatters by a multiple of the light around.
+//!
+//! The estimate keeps what the title's own program left where it is
+//! brighter. Without rays that leftover can be the screen probes' memory of
+//! bright neon, a purple cast over a night street. `VICTORY_AMBIENT_WAS`
+//! (0..1, default 1) keeps only that share of it; 0 leaves the estimate's
+//! light alone.
 
 use std::sync::{Mutex, OnceLock};
 
@@ -112,6 +118,16 @@ fn air() -> f32 {
     })
 }
 
+/// Share of the light the title's own program left that the estimate keeps
+/// (`VICTORY_AMBIENT_WAS=<0..1>`; unset: 1, all of it, as before).
+fn was() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| {
+        let set = std::env::var("VICTORY_AMBIENT_WAS").unwrap_or_default();
+        set.trim().parse().ok().filter(|v: &f32| v.is_finite()).map_or(1.0, |v: f32| v.clamp(0.0, 1.0))
+    })
+}
+
 /// Strength and radius of the creases' shade.
 fn shade() -> [f32; 2] {
     static SET: OnceLock<[f32; 2]> = OnceLock::new();
@@ -137,7 +153,7 @@ const SOURCE: &str = r#"
 cbuffer Set : register(b0) {
     float level; float constant; float strength; float radius;
     float near; float tan_y; uint width; uint height;
-    float follow; float most; float air; float unused;
+    float follow; float most; float air; float keep_was;
 };
 Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
@@ -325,7 +341,7 @@ void raise(uint3 at : SV_DispatchThreadID) {
     // outdoors, not the blocks of other memory.
     float top = max(dot(found, LUMA) * most, 1e-6);
     float has = dot(was, LUMA);
-    was *= min(1.0, top / max(has, 1e-6));
+    was *= min(1.0, top / max(has, 1e-6)) * keep_was;
     light[p] = pack(max(was, found));
 }
 #endif
@@ -461,6 +477,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[8] = 0.04f32.to_bits();
     words[9] = 4.0f32.to_bits();
     words[10] = air().to_bits();
+    words[11] = was().to_bits();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
