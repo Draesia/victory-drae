@@ -5,13 +5,13 @@
 //! input module); a pad still works.
 //!
 //! The settings are read once at start, so a change is saved to the file
-//! `VICTORY_MENU_FILE` names (`scripts\play-foxhound.ps1` sets it to
-//! `victory-settings.txt` in the repository's folder and applies it at every
-//! start) and takes effect at the next start; "SAVE AND RESTART" starts the
-//! launcher again (`VICTORY_MENU_PLAY`, with `VICTORY_MENU_ARGS`) and ends
-//! this run. The `VICTORY_MENU_...` settings are the launcher's own choices
-//! (DLSS mode, frame generation, frame rate, console, picture size), which it
-//! turns into the layer's switches; the others are the switches themselves.
+//! `VICTORY_MENU_FILE` names (`run-corgi.cmd` sets it to
+//! `corgi-settings.txt` beside itself and applies it over its arguments at
+//! every start) and takes effect at the next start; "SAVE AND RESTART" starts
+//! the launcher again (`VICTORY_MENU_PLAY`, with `VICTORY_MENU_ARGS`) and ends
+//! this run. `VICTORY_MENU_FRAMEGEN` is the launcher's own choice (0, or the
+//! frames shown for each one rendered), which it turns into
+//! `VICTORY_FRAMEGEN`/`VICTORY_FRAMEGEN_X`; the others are the switches themselves.
 //!
 //! In every build, as the stats panel is. Drawn as
 //! that panel is: white text on a black box, copied onto the swap chain's
@@ -55,36 +55,34 @@ const UNSET_ON: &[(&str, &str)] = &[("", "OFF"), ("1", "ON")];
 const STAGES: &[(&str, &str)] = &[("2", "2"), ("1", "1"), ("0", "0 OFF")];
 
 /// The first value of each is what the launcher starts with.
+/// victory-corgi: the switches run-corgi.cmd and this build read (foxhound's
+/// list named switches corgi does not have). Switches in the shader cache
+/// key are left out: a change of one needs warm-corgi.cmd first.
 #[rustfmt::skip]
 const ITEMS: &[Item] = &[
-    // The launcher's own choices.
-    Item { var: "VICTORY_MENU_DLSS", label: "DLSS", values: &[("quality", "QUALITY"), ("balanced", "BALANCED"), ("performance", "PERFORMANCE"), ("dlaa", "DLAA (NATIVE)"), ("off", "OFF")], live: false },
-    Item { var: "VICTORY_MENU_FRAMEGEN", label: "FRAME GENERATION", values: &[("0", "OFF"), ("2", "2X"), ("3", "3X"), ("4", "4X"), ("5", "5X"), ("6", "6X (MOST)")], live: false },
-    Item { var: "VICTORY_MENU_FPS", label: "FRAME RATE CAP", values: &[("1000", "NONE"), ("120", "120"), ("60", "60"), ("30", "30 (THE GAME)")], live: false },
-    Item { var: "VICTORY_FPS_LINE", label: "FPS AT THE TOP", values: &[("1", "ON"), ("0", "OFF")], live: true },
-    Item { var: "VICTORY_PANEL", label: "STATS PANEL (F3)", values: &[("0", "OFF"), ("1", "ON")], live: true },
-    Item { var: "VICTORY_MENU_CONSOLE", label: "CONSOLE", values: &[("series-x", "SERIES X"), ("series-s", "SERIES S (FASTER)")], live: false },
-    Item { var: "VICTORY_MENU_RES", label: "SERIES X PICTURE", values: &[("1440", "2560X1440"), ("1080to1440", "1080P TO 1440P"), ("4k", "3840X2160")], live: false },
-    // The layer's switches.
+    // DLSS and frame generation (Streamline).
+    Item { var: "VICTORY_DLSS", label: "DLSS", values: &[("", "OFF"), ("1", "ON")], live: false },
+    Item { var: "VICTORY_DLSS_MODE", label: "DLSS MODE", values: &[("", "QUALITY"), ("balanced", "BALANCED"), ("performance", "PERFORMANCE"), ("ultraperformance", "ULTRA PERFORMANCE"), ("dlaa", "DLAA (NATIVE)")], live: false },
     Item { var: "VICTORY_DLSS_PRESET", label: "DLSS MODEL", values: &[("", "DEFAULT"), ("k", "K"), ("j", "J"), ("m", "M"), ("l", "L")], live: false },
+    Item { var: "VICTORY_MENU_FRAMEGEN", label: "FRAME GENERATION", values: &[("0", "OFF"), ("2", "2X"), ("3", "3X"), ("4", "4X"), ("5", "5X"), ("6", "6X (MOST)")], live: false },
+    Item { var: "VICTORY_FRAME_INTERVAL_MS", label: "FRAME RATE CAP", values: &[("", "30 (THE GAME)"), ("16.667", "60"), ("8.333", "120"), ("0", "NONE")], live: false },
+    Item { var: "VICTORY_NATIVE_1440P", label: "2560X1440 OUTPUT", values: UNSET_ON, live: false },
+    Item { var: "VICTORY_FPS_LINE", label: "FPS AT THE TOP", values: &[("", "ON"), ("0", "OFF")], live: true },
+    Item { var: "VICTORY_PANEL", label: "STATS PANEL (F3)", values: &[("", "OFF"), ("1", "ON")], live: true },
+    // corgi's own switches.
+    Item { var: "VICTORY_WC_NO_BACK", label: "SKIP BIG COPY-BACKS", values: UNSET_ON, live: false },
+    Item { var: "VICTORY_TEXTURE_FAST_HASH", label: "FAST TEXTURE HASH", values: UNSET_ON, live: false },
     Item { var: "VICTORY_AMBIENT", label: "LIGHT ESTIMATE", values: &[("0.8", "0.8"), ("1", "1"), ("0.5", "0.5"), ("", "OFF")], live: false },
-    Item { var: "VICTORY_AMBIENT_SPECULAR", label: "REFLECTION ESTIMATE", values: ON_UNSET, live: false },
     Item { var: "VICTORY_AMBIENT_AIR", label: "FOG CAP", values: &[("1.5", "1.5"), ("1", "1"), ("2", "2"), ("", "NONE")], live: false },
-    Item { var: "VICTORY_BVH_BUILDER", label: "RAY TRACING (SLOW, BROKEN)", values: UNSET_ON, live: false },
-    Item { var: "VICTORY_WATER_LIGHT", label: "WATER LIGHT", values: &[("", "OFF (NO DARK BLOCKS)"), ("1", "ON (GREEN, DARK BLOCKS)")], live: false },
-    Item { var: "VICTORY_LEAVE_OUT", label: "HEAT HAZE AND DECAL DEFRAG", values: &[("02384a60fda6f2d0,731a39171b568298", "LEFT OUT"), ("", "RUN (SLOWER, SMEARS)")], live: false },
-    Item { var: "VICTORY_EARLY_DEPTH", label: "EARLY DEPTH TEST", values: ON_UNSET, live: false },
-    Item { var: "VICTORY_WC_NO_BACK", label: "SKIP BIG COPY-BACKS", values: ON_UNSET, live: false },
-    Item { var: "VICTORY_SOFT_VIEWS", label: "SOFT VIEWS (NO CUT FREEZES)", values: &[("copies", "ON"), ("", "OFF")], live: false },
-    Item { var: "VICTORY_TEXTURE_NO_WAIT", label: "TEXTURE NO WAIT", values: ON_UNSET, live: false },
-    Item { var: "VICTORY_RELAY", label: "RELAY (SPEED, TRIANGLES)", values: STAGES, live: false },
-    Item { var: "VICTORY_CARD_STEPS", label: "CARD STEPS", values: STAGES, live: false },
-    Item { var: "VICTORY_INDIRECT_BATCH", label: "INDIRECT BATCH", values: STAGES, live: false },
-    Item { var: "VICTORY_CARD_BUFFERS_MIN_KB", label: "CARD COMPARES FROM (KB)", values: &[("64", "64"), ("1024", "1024")], live: false },
-    Item { var: "VICTORY_PORT_CONSTANTS", label: "CONSTANTS HEAP IN PLACE", values: UNSET_ON, live: false },
+    Item { var: "VICTORY_AMBIENT_WAS", label: "LEFTOVER PROBE LIGHT", values: &[("", "KEPT"), ("0", "DROPPED")], live: false },
+    Item { var: "VICTORY_SUBMIT_FRAMES", label: "FRAMES AHEAD", values: &[("", "1"), ("2", "2"), ("3", "3")], live: false },
+    Item { var: "VICTORY_THIN_THREADS", label: "LIST THREADS", values: &[("", "8"), ("4", "4")], live: false },
+    Item { var: "VICTORY_WINDOWS_BAR_MB", label: "BAR CAP (MB)", values: &[("", "2048"), ("4096", "4096")], live: false },
+    Item { var: "VICTORY_INDIRECT_WIDE", label: "WIDE INDIRECT", values: &[("", "OFF"), ("force", "ON")], live: false },
+    Item { var: "VICTORY_RAW_VIEW_CLAMP", label: "RAW VIEW CLAMP", values: &[("", "ON"), ("0", "OFF")], live: false },
 ];
 /// The lines after the settings.
-const ACTIONS: [&str; 4] = ["SAVE AND RESTART NOW", "SAVE FOR NEXT START", "RESET ALL TO PLAY DEFAULTS", "CLOSE"];
+const ACTIONS: [&str; 4] = ["SAVE AND RESTART NOW", "SAVE FOR NEXT START", "RESET ALL TO THE ARGUMENTS", "CLOSE"];
 
 fn get(var: &str) -> String {
     std::env::var(var).unwrap_or_default()
@@ -345,7 +343,7 @@ impl Menu {
     /// Writes the changed values over those in the settings file.
     fn save(&mut self) -> bool {
         let Some(path) = std::env::var_os("VICTORY_MENU_FILE") else {
-            self.note = "NO SETTINGS FILE: START WITH PLAY-FOXHOUND.PS1".to_owned();
+            self.note = "NO SETTINGS FILE: START WITH RUN-CORGI.CMD".to_owned();
             return false;
         };
         let mut kept: Vec<(String, String)> = std::fs::read_to_string(&path)
@@ -361,7 +359,7 @@ impl Menu {
             kept.retain(|(k, _)| k != item.var);
             kept.push((item.var.to_owned(), self.values[i].clone()));
         }
-        let mut text = String::from("# Saved by the F1 menu; scripts\\play-foxhound.ps1 applies these over its own settings (an empty value: unset).\r\n");
+        let mut text = String::from("# Saved by the F1 menu; run-corgi.cmd applies these over its arguments (an empty value: unset).\r\n");
         for (k, v) in &kept {
             text.push_str(&format!("{k}={v}\r\n"));
         }
@@ -389,7 +387,11 @@ impl Menu {
         };
         let play = play.to_string_lossy().replace('\'', "''");
         let args = get("VICTORY_MENU_ARGS");
-        let command = format!("Start-Sleep 3; & '{play}' {args}");
+        // corgi: run-corgi.cmd runs the tree it is started in (`VICTORY_MENU_DIR`).
+        let at = std::env::var("VICTORY_MENU_DIR")
+            .map(|d| format!("Set-Location -LiteralPath '{}'; ", d.replace('\'', "''")))
+            .unwrap_or_default();
+        let command = format!("Start-Sleep 3; {at}& '{play}' {args}");
         const CREATE_NEW_CONSOLE: u32 = 0x10;
         match std::process::Command::new("powershell.exe")
             .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &command])
@@ -419,7 +421,7 @@ impl Menu {
         if let Some(path) = std::env::var_os("VICTORY_MENU_FILE") {
             let _ = std::fs::remove_file(path);
         }
-        self.note = "RESET. PLAY DEFAULTS AT THE NEXT START".to_owned();
+        self.note = "RESET. THE ARGUMENTS ALONE AT THE NEXT START".to_owned();
     }
 
     /// A frame was presented: the keys pressed since the last one.
