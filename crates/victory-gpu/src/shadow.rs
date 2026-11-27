@@ -4987,6 +4987,7 @@ fn buffers() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entr
     let map = BUFFERS.write().unwrap_or_else(|e| e.into_inner());
     // What threads remember of it ([`FOUND`]) is of before.
     BUFFERS_CHANGED.fetch_add(1, Ordering::SeqCst);
+    looked(look::FLUSHES);
     map
 }
 
@@ -5036,8 +5037,85 @@ fn found_most() -> usize {
 }
 
 /// Since the last frame line: asks answered from a thread's own memory of
-/// them, and asks that went to the tables.
-pub(crate) static LOOKUPS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// them, and asks that went to the tables; then why the memory did not
+/// answer, which is what says how to make it answer more often
+/// ([`look::`]). A miss is one of four things and they want opposite fixes:
+/// a slot never written (the table is cold, or too small for the working
+/// set); a slot holding ANOTHER ask (the table is direct-mapped, so two
+/// asks that hash together evict each other for ever); the right ask at a
+/// stale count (some thread took [`BUFFERS`] to write and every thread's
+/// memory of everything was thrown away); and the right ask whose copy has
+/// since gone. Beside them: slots overwritten while holding another live
+/// ask (the pressure that makes the second kind), and the times the count
+/// went up (the flushes that make the third).
+pub(crate) static LOOKUPS: [AtomicU64; look::COUNT] = [const { AtomicU64::new(0) }; look::COUNT];
+
+/// Offsets into [`LOOKUPS`].
+pub(crate) mod look {
+    pub(crate) const QUICK: usize = 0;
+    pub(crate) const TABLES: usize = 1;
+    pub(crate) const COLD: usize = 2;
+    pub(crate) const CLASH: usize = 3;
+    pub(crate) const STALE: usize = 4;
+    pub(crate) const GONE: usize = 5;
+    pub(crate) const EVICTED: usize = 6;
+    pub(crate) const FLUSHES: usize = 7;
+    /// Misses whose buffer was the last one this thread found, and one of
+    /// its last [`super::RECENT_BUFFERS`] ([`recent_probe`](super::recent_probe)).
+    pub(crate) const WOULD_LAST: usize = 8;
+    pub(crate) const WOULD_RECENT: usize = 9;
+    /// Nanoseconds the misses took in all ([`lookup_tables`](super::lookup_tables)),
+    /// and of them those that found no buffer and went on to the windows
+    /// outside buffers (`loose`): their number, and their nanoseconds.
+    pub(crate) const MISS_NS: usize = 10;
+    pub(crate) const LOOSE: usize = 11;
+    pub(crate) const LOOSE_NS: usize = 12;
+    pub(crate) const COUNT: usize = 13;
+}
+
+/// How many buffers the probe remembers per thread.
+const RECENT_BUFFERS: usize = 8;
+
+thread_local! {
+    /// The buffers (start, end) this thread's misses last found, most
+    /// recent first: for [`recent_probe`].
+    static RECENT: std::cell::Cell<[(u64, u64); RECENT_BUFFERS]> = const { std::cell::Cell::new([(0, 0); RECENT_BUFFERS]) };
+}
+
+/// A probe, no more: would a memory keyed by the CONTAINING BUFFER rather
+/// than by the exact ask have answered this miss? The ask cache keys on
+/// (address, bytes), and the title places views at ring positions inside
+/// its big heaps (see [`exact`]), so most asks are new addresses that no
+/// size of ask cache can have seen: run 05139 took the table from 8,192
+/// to 32,768 slots and the hit rate went from 59.4 % to 57.8 %. If the
+/// buffer `[start, end)` the miss found is among those this thread found
+/// last, a cache of buffers would have answered it. Counted only where the
+/// buffer is the one the tables' search gave, so it is a floor.
+fn recent_probe(start: u64, end: u64) {
+    RECENT.with(|r| {
+        let mut list = r.get();
+        match list.iter().position(|&b| b == (start, end)) {
+            Some(0) => {
+                looked(look::WOULD_LAST);
+                looked(look::WOULD_RECENT);
+            }
+            Some(i) => {
+                looked(look::WOULD_RECENT);
+                list.copy_within(0..i, 1);
+                list[0] = (start, end);
+            }
+            None => {
+                list.copy_within(0..RECENT_BUFFERS - 1, 1);
+                list[0] = (start, end);
+            }
+        }
+        r.set(list);
+    });
+}
+
+fn looked(which: usize) {
+    LOOKUPS[which].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
 
 /// An ask (address, bytes), the count of changes it was answered at, and the
 /// answer.
@@ -5067,8 +5145,24 @@ fn found(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let changed = BUFFERS_CHANGED.load(Ordering::SeqCst);
     let shadow = FOUND.with(|f| {
         let f = f.borrow();
-        let (a, n, at, shadow) = f.get(found_at(address, len))?;
-        ((*a, *n, *at) == (address, len, changed)).then(|| shadow.upgrade()).flatten()
+        let Some((a, n, at, shadow)) = f.get(found_at(address, len)) else {
+            // The table is not made until this thread's first answer.
+            looked(look::COLD);
+            return None;
+        };
+        if (*a, *n) != (address, len) {
+            looked(if (*a, *n) == (0, 0) { look::COLD } else { look::CLASH });
+            return None;
+        }
+        if *at != changed {
+            looked(look::STALE);
+            return None;
+        }
+        let up = shadow.upgrade();
+        if up.is_none() {
+            looked(look::GONE);
+        }
+        up
     })?;
     // Whoever takes the map to let a copy go that nobody holds finds it held
     // now, or had counted before: then it is not handed out.
@@ -5083,7 +5177,13 @@ fn remember(address: u64, len: u64, changed: u64, shadow: &Arc<Shadow>) {
         if f.is_empty() {
             f.resize_with(found_most(), || (0, 0, 0, std::sync::Weak::new()));
         }
-        f[found_at(address, len)] = (address, len, changed, Arc::downgrade(shadow));
+        let slot = &mut f[found_at(address, len)];
+        // A slot taken from another ask that is still alive: the pressure
+        // that makes `look::CLASH`, and what associativity would relieve.
+        if (slot.0, slot.1) != (0, 0) && (slot.0, slot.1) != (address, len) && slot.3.strong_count() > 0 {
+            looked(look::EVICTED);
+        }
+        *slot = (address, len, changed, Arc::downgrade(shadow));
     });
 }
 
@@ -5206,12 +5306,23 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         return Some(shadow);
     }
     LOOKUPS[1].fetch_add(1, Ordering::Relaxed);
+    // What a miss costs, to say whether making misses cheaper is worth it
+    // (60,000 a frame in run 11505, against 167 ms of translation).
+    let started = std::time::Instant::now();
+    let found = lookup_tables(address, len, any, quick);
+    LOOKUPS[look::MISS_NS].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    found
+}
+
+/// [`lookup`] once its thread's memory did not answer: the tables.
+fn lookup_tables(address: u64, len: u64, any: bool, quick: bool) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
     {
         let map = buffers_read();
         match map.range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end) {
             // The copy is made already (nearly always).
-            Some((_, Entry { shadow: Some(shadow), .. })) => {
+            Some((key, Entry { shadow: Some(shadow), end: buffer_end })) => {
+                recent_probe(key.0, *buffer_end);
                 if quick {
                     // (Nobody changes the map while this lock is held.)
                     remember(address, len, BUFFERS_CHANGED.load(Ordering::SeqCst), shadow);
@@ -5221,7 +5332,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             Some(_) => {}
             None => {
                 drop(map);
-                return loose(address, end, len <= 1, any);
+                return timed_loose(address, end, len <= 1, any);
             }
         }
     }
@@ -5235,7 +5346,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         .map(|(k, _)| *k);
     let Some(key) = key else {
         drop(map);
-        return loose(address, end, len <= 1, any);
+        return timed_loose(address, end, len <= 1, any);
     };
     let entry = map.get_mut(&key)?;
     if entry.shadow.is_none() {
@@ -5618,6 +5729,15 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     Some(shadow)
 }
 
+/// [`loose`] for a miss of [`lookup_tables`], counted and timed.
+fn timed_loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
+    let started = std::time::Instant::now();
+    let found = loose(address, end, unsized_ask, any);
+    looked(look::LOOSE);
+    LOOKUPS[look::LOOSE_NS].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    found
+}
+
 /// Copies of single buffer views' own bytes ([`exact`]), by (start,
 /// bytes), each with the asking that last took it; and the askings so far.
 #[allow(clippy::type_complexity)]
@@ -5687,15 +5807,47 @@ pub(crate) static OWN_MADE: AtomicU64 = AtomicU64::new(0);
 /// bytes ([`exact`]), per frame over `frames`, and the copies kept now.
 /// Nothing while there are none.
 pub(crate) fn exact_line(frames: f64) {
-    let [quick, tables] = [0, 1].map(|i| LOOKUPS[i].swap(0, Ordering::Relaxed));
+    let l: Vec<u64> = LOOKUPS.iter().map(|c| c.swap(0, Ordering::Relaxed)).collect();
+    let (quick, tables) = (l[look::QUICK], l[look::TABLES]);
     if quick + tables > 0 {
+        let per = |i: usize| l[i] as f64 / frames;
+        let share = |i: usize| 100.0 * l[i] as f64 / tables.max(1) as f64;
         tracing::info!(
             "asks for a buffer's host copy per frame (VICTORY_QUICK_FIND, {} slots a thread): \
-             {:.0} answered from the thread's own memory ({:.1} %), {:.0} went to the tables' lock",
+             {:.0} answered from the thread's own memory ({:.1} %), {:.0} went to the tables' lock. \
+             Of those, {:.0} ({:.0} %) found the slot never written, {:.0} ({:.0} %) found another ask in it \
+             (the table is direct-mapped: raise VICTORY_QUICK_FIND_SLOTS or make it associative), \
+             {:.0} ({:.0} %) found the right ask thrown away by a write to the tables, and {:.0} ({:.0} %) \
+             found its copy gone; {:.0} slots a frame were taken from an ask still alive, and the tables \
+             were taken to write {:.0} times a frame (each throws away every thread's memory of everything). \
+             Of the misses, {:.0} ({:.0} %) were in the buffer this thread found last and {:.0} ({:.0} %) in one \
+             of the last {} it found: what a memory keyed by buffer rather than by ask would have answered. \
+             A miss took {:.2} us on average, {:.1} ms a frame on all threads; {:.0} of them found no buffer and \
+             went on to the windows outside buffers, {:.2} us each, {:.1} ms a frame",
             found_most(),
-            quick as f64 / frames,
+            per(look::QUICK),
             100.0 * quick as f64 / (quick + tables).max(1) as f64,
-            tables as f64 / frames
+            per(look::TABLES),
+            per(look::COLD),
+            share(look::COLD),
+            per(look::CLASH),
+            share(look::CLASH),
+            per(look::STALE),
+            share(look::STALE),
+            per(look::GONE),
+            share(look::GONE),
+            per(look::EVICTED),
+            per(look::FLUSHES),
+            per(look::WOULD_LAST),
+            share(look::WOULD_LAST),
+            per(look::WOULD_RECENT),
+            share(look::WOULD_RECENT),
+            RECENT_BUFFERS,
+            l[look::MISS_NS] as f64 / 1000.0 / tables.max(1) as f64,
+            per(look::MISS_NS) / 1e6,
+            per(look::LOOSE),
+            l[look::LOOSE_NS] as f64 / 1000.0 / l[look::LOOSE].max(1) as f64,
+            per(look::LOOSE_NS) / 1e6,
         );
     }
     let [asked, made] = [0, 1].map(|i| EXACT_STATS[i].swap(0, Ordering::Relaxed));

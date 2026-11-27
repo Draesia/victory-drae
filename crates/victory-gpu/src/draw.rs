@@ -337,6 +337,10 @@ pub(crate) struct State {
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u32, u64), FreshTable, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
+    /// Ordinary tables (not made afresh) a stage's draw brought up to date
+    /// in this list, by a hash of who reads them, the tables' handles and
+    /// what the descriptors there hold ([`State::ordinary_tables`]).
+    tabled_once: std::collections::HashMap<u64, TabledOnce, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list has run, is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -382,6 +386,7 @@ impl State {
             crate::descriptor::release_dynamic(heap, first, n);
         }
         self.fresh_tables.clear();
+        self.tabled_once.clear();
         self.recording = 0;
         self.root_srv_slots.clear();
         self.root_uav_slots.clear();
@@ -1441,12 +1446,14 @@ impl State {
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        let bind_began = std::time::Instant::now();
         // The debugger's live view: this pipeline's calls and what binding it costs.
         #[cfg(feature = "diagnostics")]
         let _live = crate::debugger::live::bind(&p.name, compute, p.root.as_raw() as usize, p.pso.as_raw() as usize);
         let l = &list.list;
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
+        let textured = std::time::Instant::now();
         if crate::host::walls_trace() {
             self.walls_census(p, compute);
         }
@@ -1504,6 +1511,8 @@ impl State {
             // The title may release the pipeline before it submits the list.
             list.bind_pipeline(&p.name, &p.pso, &p.root);
         }
+        let bound = std::time::Instant::now();
+        let mut tables_ns = 0u64;
         for stage in &p.stages {
             let t = stage.translated();
             // A traced shader: this bind's tag and lane (`crate::debugger::trace`).
@@ -1522,6 +1531,7 @@ impl State {
             if t.stores && crate::picked::on() && crate::picked::picks(&stage.shader, &t.picks) {
                 crate::picked::runs_in(list);
             }
+            let tables_began = std::time::Instant::now();
             let made = self.tables(
                 list,
                 &t.used,
@@ -1529,6 +1539,7 @@ impl State {
                 &t.host.half_views,
                 compute,
             );
+            tables_ns += tables_began.elapsed().as_nanos() as u64;
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
@@ -1726,6 +1737,14 @@ impl State {
         // Depth textures it writes through unordered access: their colour
         // twins hold what they lack from here on.
         list.twins_written();
+        let stages_ns = bound.elapsed().as_nanos() as u64;
+        let ns = |a: std::time::Instant, b: std::time::Instant| (b - a).as_nanos() as u64;
+        BIND_SPLIT[0].fetch_add(1, Ordering::Relaxed);
+        BIND_SPLIT[1].fetch_add(ns(bind_began, textured), Ordering::Relaxed);
+        BIND_SPLIT[2].fetch_add(ns(textured, bound), Ordering::Relaxed);
+        BIND_SPLIT[3].fetch_add(tables_ns, Ordering::Relaxed);
+        BIND_SPLIT[4].fetch_add(stages_ns.saturating_sub(tables_ns), Ordering::Relaxed);
+        BIND_SPLIT[5].fetch_add(p.stages.len() as u64, Ordering::Relaxed);
         true
     }
 
@@ -3190,25 +3209,136 @@ impl State {
         }
     }
 
-    fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool) {
-        let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
+    /// The entries of `used` in tables that are not made afresh (`fresh`
+    /// names those): each mirrored, made readable and noted as a table's
+    /// ([`State::table_entry`]). Once per list while what they show stays as
+    /// the draw left it.
+    ///
+    /// This ran for every entry of every stage of every draw: making
+    /// descriptor tables was 11.65 us of a bind and 105.6 ms a frame (run
+    /// 24629), about 80 % of binding, and binding most of an indirect
+    /// draw. Keyed by the list's epoch the skip hit 7.6 % of the time: the
+    /// epoch moves when ANY texture of the list changes state, which is
+    /// nearly every draw (a target becoming readable, a depth plane moving
+    /// from write to test). So the key is finer: who reads, the tables'
+    /// handles and the descriptors' words there (a rewritten descriptor is
+    /// another key), and to stay valid, each title resource the entries
+    /// showed must keep the number [`HostList::changed_resource`] gives it,
+    /// and the list's number for everything else (copies, deferred writes,
+    /// twins settled, a reset) must not move. Unordered access views and
+    /// aliased textures are done every time. `VICTORY_TABLE_ONCE=0`: every
+    /// time, as before.
+    fn ordinary_tables(&mut self, list: &HostList, used: &[UsedResource], fresh: &Few<u8, 16>, compute: bool) {
+        let ordinary = |u: &&UsedResource| u.root == RootType::Table && !fresh.contains(&u.slot);
+        if !table_once() {
+            for u in used.iter().filter(ordinary) {
+                self.table_entry(list, u, compute);
+            }
             return;
+        }
+        let reader = (used.as_ptr() as usize, used.len(), STORES.get(), TESTED_DEPTH.get().0);
+        let mut h = RecordHash::default();
+        h.add([reader.0 as u32, (reader.0 >> 32) as u32, reader.1 as u32]);
+        h.add([u32::from(reader.2), reader.3 as u32, (reader.3 >> 32) as u32]);
+        let at = std::ptr::from_ref(list) as usize;
+        h.add([u32::from(compute), at as u32, (at >> 32) as u32]);
+        let mut any = false;
+        for u in used.iter().filter(ordinary) {
+            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
+                continue;
+            };
+            let handle = table + u64::from(u.table_offset_dwords) * 4;
+            h.add([handle as u32, (handle >> 32) as u32, u32::from(u.slot)]);
+            if self.heap_of(handle).is_some() {
+                // SAFETY: a descriptor slot in title memory, in a heap the
+                // title set (as [`State::tables`] reads a fresh table's).
+                h.add(unsafe { (handle as *const [u32; 3]).read_unaligned() });
+            }
+            any = true;
+        }
+        if !any {
+            return;
+        }
+        let key = h.0;
+        if let Some(known) = self.tabled_once.get(&key)
+            && known.other == list.other_generation()
+            && list.resources_unchanged(&known.resources)
+        {
+            if known.depth {
+                TESTED_DEPTH.set((reader.3, true));
+            }
+            TABLE_ONCE[0].fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        TABLE_ONCE[1].fetch_add(1, Ordering::Relaxed);
+        let before = TESTED_DEPTH.get();
+        TESTED_DEPTH.set((before.0, false));
+        let mut shown: Vec<usize> = Vec::new();
+        let mut cached = true;
+        for u in used.iter().filter(ordinary) {
+            match self.table_entry(list, u, compute) {
+                Shown::Resource(r) => shown.push(r),
+                Shown::Always => cached = false,
+                Shown::Nothing | Shown::Memory => {}
+            }
+        }
+        let depth = TESTED_DEPTH.get().1;
+        TESTED_DEPTH.set((before.0, before.1 || depth));
+        if !cached {
+            self.tabled_once.remove(&key);
+            return;
+        }
+        shown.sort_unstable();
+        shown.dedup();
+        // The numbers as this draw leaves them: what it changed itself it
+        // need not do again.
+        let mut gens = Vec::with_capacity(shown.len());
+        list.resource_generations(&shown, &mut gens);
+        if self.tabled_once.len() >= 4096 {
+            self.tabled_once.clear();
+        }
+        self.tabled_once.insert(
+            key,
+            TabledOnce { other: list.other_generation(), resources: shown.into_iter().zip(gens).collect(), depth },
+        );
+    }
+
+    /// Brings one table entry of a draw up to date; what it showed, for
+    /// [`State::ordinary_tables`].
+    fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool) -> Shown {
+        let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
+            return Shown::Nothing;
         };
         let handle = table + u64::from(u.table_offset_dwords) * 4;
         let Some(heap) = self.heap_of(handle) else {
-            return;
+            return Shown::Nothing;
         };
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
-            return;
+            return Shown::Nothing;
         };
-        if let Some(view) = host.mirror(index, handle, true) {
-            readable(list, u.kind, &view);
-            // Up to date by this draw: not the texture pass's to make.
-            if crate::descriptor::host::is_texture_view(&view) {
-                host.texture_slot_tabled(index, true);
-            } else {
-                host.slot_tabled(index);
+        let Some(view) = host.mirror(index, handle, true) else {
+            return Shown::Nothing;
+        };
+        readable(list, u.kind, &view);
+        // Up to date by this draw: not the texture pass's to make.
+        if crate::descriptor::host::is_texture_view(&view) {
+            host.texture_slot_tabled(index, true);
+        } else {
+            host.slot_tabled(index);
+        }
+        if u.kind == ResourceType::Uav {
+            return Shown::Always;
+        }
+        let placed = crate::descriptor::host::placed_texture(&view);
+        match placed.as_ref().unwrap_or(&view) {
+            View::Shader(r, _) | View::Unordered(r, _, _) => {
+                if crate::resource::alias_of(*r as This).is_some() {
+                    Shown::Always
+                } else {
+                    Shown::Resource(*r)
+                }
             }
+            _ => Shown::Memory,
         }
     }
 
@@ -3299,11 +3429,7 @@ impl State {
             }
         }
         fresh.sort_unstable();
-        for u in used.iter().filter(tables) {
-            if !fresh.contains(&u.slot) {
-                self.table_entry(list, u, compute);
-            }
-        }
+        self.ordinary_tables(list, used, &fresh, compute);
         let mut made = Few::default();
         for &slot in fresh.iter() {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
@@ -3383,7 +3509,7 @@ impl State {
                 // list changed since: nothing to do again.
                 let once = ready_once() && selected.is_empty() && entries().all(|u| u.kind != ResourceType::Uav);
                 if once
-                    && known.epoch == list.epoch()
+                    && known.epoch == fresh_epoch(list)
                     && let Some((_, depth)) = known.ready.iter().find(|(r, _)| *r == reader)
                 {
                     if *depth {
@@ -3416,7 +3542,7 @@ impl State {
                 if once && let Some(known) = self.fresh_tables.get_mut(&key) {
                     // (The epoch as it is now: what this changed itself it
                     // need not do again.)
-                    let epoch = list.epoch();
+                    let epoch = fresh_epoch(list);
                     if known.epoch != epoch {
                         known.epoch = epoch;
                         known.ready.clear();
@@ -3848,6 +3974,7 @@ impl State {
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
+        let began = std::time::Instant::now();
         // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
@@ -3926,6 +4053,7 @@ impl State {
             why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
             return false;
         }
+        let found = std::time::Instant::now();
         // One record without a count: clamped in a batch (`batches`).
         let batch = if batches() > 0 && max == 1 && count.is_none() {
             args.refresh(list, arguments, len);
@@ -3959,6 +4087,13 @@ impl State {
             .filter(|w| same(w) && offset >= w.base)
             .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
             .map(|w| (w.scratch.clone(), offset - w.base));
+        let path = if batch.is_some() {
+            indirect_path::BATCH
+        } else if hit.is_some() {
+            indirect_path::WINDOW
+        } else {
+            indirect_path::CLAMP
+        };
         let (bounded, at) = match batch.or(hit) {
             Some(hit) => hit,
             None => {
@@ -4017,6 +4152,7 @@ impl State {
                 (bounded, 0)
             }
         };
+        let clamped = std::time::Instant::now();
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
@@ -4027,6 +4163,7 @@ impl State {
             why("prepare failed");
             return false;
         }
+        let prepared = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let probe = crate::debugger::pixel::before(
             list,
@@ -4072,7 +4209,57 @@ impl State {
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
+        let ns = |a: std::time::Instant, b: std::time::Instant| (b - a).as_nanos() as u64;
+        let at = &INDIRECT_SPLIT[path * 5..path * 5 + 5];
+        at[0].fetch_add(1, Ordering::Relaxed);
+        at[1].fetch_add(ns(began, found), Ordering::Relaxed);
+        at[2].fetch_add(ns(found, clamped), Ordering::Relaxed);
+        at[3].fetch_add(ns(clamped, prepared), Ordering::Relaxed);
+        at[4].fetch_add(ns(prepared, std::time::Instant::now()), Ordering::Relaxed);
         true
+    }
+}
+
+/// Which way an indirect execution got its arguments clamped: in a batch of
+/// single records, from a window clamped ahead, or by a clamp of its own
+/// (which binds a compute pipeline and so makes the draw rebind everything).
+mod indirect_path {
+    pub(super) const BATCH: usize = 0;
+    pub(super) const WINDOW: usize = 1;
+    pub(super) const CLAMP: usize = 2;
+    pub(super) const NAMES: [&str; 3] = ["batched", "from a window", "clamped on its own"];
+}
+
+/// Since the last frame line, for each [`indirect_path`]: indirect
+/// executions that ran, then nanoseconds in finding the pipeline and the
+/// arguments' copies, in the clamp, in preparing the draw (binding), and in
+/// the host's call and what follows. Indirect executions are 60 % of list
+/// translation, 19 us each (run 20305); this says which part of them.
+static INDIRECT_SPLIT: [AtomicU64; 15] = [const { AtomicU64::new(0) }; 15];
+
+/// For the frame-rate line: [`INDIRECT_SPLIT`] per frame.
+pub(crate) fn indirect_line(frames: f64) {
+    let s: Vec<u64> = INDIRECT_SPLIT.iter().map(|c| c.swap(0, Ordering::Relaxed)).collect();
+    let parts: Vec<String> = (0..3)
+        .filter(|&p| s[p * 5] != 0)
+        .map(|p| {
+            let n = s[p * 5] as f64;
+            let us = |i: usize| s[p * 5 + i] as f64 / 1000.0 / n;
+            let ms = (1..5).map(|i| s[p * 5 + i]).sum::<u64>() as f64 / 1e6 / frames;
+            format!(
+                "{} {:.0} a frame, {:.1} ms (each: finding {:.2} us, clamp {:.2}, preparing {:.2}, the call {:.2})",
+                indirect_path::NAMES[p],
+                n / frames,
+                ms,
+                us(1),
+                us(2),
+                us(3),
+                us(4)
+            )
+        })
+        .collect();
+    if !parts.is_empty() {
+        tracing::info!("indirect executions per frame, by how their arguments were clamped: {}", parts.join("; "));
     }
 }
 
@@ -4251,6 +4438,46 @@ struct FreshTable {
 fn ready_once() -> bool {
     crate::toggled!("VICTORY_READY_ONCE")
 }
+
+/// What a fresh table made ready stays valid for: the list number of changes
+/// that are no one texture's (`VICTORY_FRESH_OTHER=0`: the list epoch, which
+/// every texture state change moves, as before).
+fn fresh_epoch(list: &HostList) -> u64 {
+    if crate::toggled!("VICTORY_FRESH_OTHER") { list.other_generation() } else { list.epoch() }
+}
+
+/// Whether ordinary tables are brought up to date once while what they
+/// show stays as it was ([`State::ordinary_tables`]; `VICTORY_TABLE_ONCE=0`:
+/// for every draw, as before).
+fn table_once() -> bool {
+    crate::toggled!("VICTORY_TABLE_ONCE")
+}
+
+/// A stage's ordinary tables as a draw left them ([`State::ordinary_tables`]):
+/// the list's number for changes of no one resource then, each title
+/// resource the entries showed with its number then, and whether a view of
+/// the tested depth texture was among them.
+struct TabledOnce {
+    other: u64,
+    resources: Vec<(usize, u64)>,
+    depth: bool,
+}
+
+/// What a table entry showed ([`State::table_entry`]).
+enum Shown {
+    /// No view: nothing was done.
+    Nothing,
+    /// A view of this title resource: valid while its number stays.
+    Resource(usize),
+    /// A view of memory (a buffer): valid while the list's other number stays.
+    Memory,
+    /// Never kept: unordered access, or an aliased texture.
+    Always,
+}
+
+/// Since the last frame line: stages whose ordinary tables were found as a
+/// draw left them and skipped, and those brought up to date.
+static TABLE_ONCE: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// A hash of records' words: 64 bits, two multiplications a record. (The
 /// standard library's took 3 % of the recording threads' time.)
@@ -4622,4 +4849,43 @@ mod record_hash_tests {
         let zeros: Vec<u64> = (2..100).map(|n| of(&vec![[0; 3]; n])).collect();
         assert!(zeros.iter().all(|h| seen.insert(*h)));
     }
+}
+
+/// Since the last frame line, of [`State::bind`] (every draw and dispatch
+/// binds): binds that ran to the end, then nanoseconds in the textures
+/// picked early, in heaps, root signature and pipeline, in the descriptor
+/// tables made for the stages ([`State::tables`]), and in the rest of the
+/// stages' binding (root views and constants); then the stages bound.
+/// Preparing an indirect draw is 18.4 us of its 19.9 (run 21442); this
+/// says which part of binding.
+static BIND_SPLIT: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+/// For the frame-rate line: [`BIND_SPLIT`] per frame.
+pub(crate) fn bind_line(frames: f64) {
+    let s: Vec<u64> = BIND_SPLIT.iter().map(|c| c.swap(0, Ordering::Relaxed)).collect();
+    if s[0] == 0 {
+        return;
+    }
+    let n = s[0] as f64;
+    let us = |i: usize| s[i] as f64 / 1000.0 / n;
+    let ms = |i: usize| s[i] as f64 / 1e6 / frames;
+    tracing::info!(
+        "binds per frame: {:.0} ({:.1} stages each); each took {:.2} us picking textures early ({:.1} ms a frame), {:.2} \
+         heaps, root signature and pipeline ({:.1} ms), {:.2} making descriptor tables ({:.1} ms), {:.2} the rest of the \
+         stages' binding ({:.1} ms); stages whose ordinary tables were as a draw left them {:.0}, brought up \
+         to date {:.0} (VICTORY_TABLE_ONCE={})",
+        n / frames,
+        s[5] as f64 / n,
+        us(1),
+        ms(1),
+        us(2),
+        ms(2),
+        us(3),
+        ms(3),
+        us(4),
+        ms(4),
+        TABLE_ONCE[0].swap(0, Ordering::Relaxed) as f64 / frames,
+        TABLE_ONCE[1].swap(0, Ordering::Relaxed) as f64 / frames,
+        u8::from(table_once())
+    );
 }

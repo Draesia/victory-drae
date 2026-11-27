@@ -364,6 +364,30 @@ pub(crate) fn line(frames: f64) {
         CHUNKS.swap(0, Relaxed) as f64 / frames,
         s[3]
     );
+    // The census by kind, the costliest first.
+    let mut kinds: Vec<(usize, u64, u64)> = (0..KINDS)
+        .map(|k| (k, KIND_CALLS[k].swap(0, Relaxed), KIND_NS[k].swap(0, Relaxed)))
+        .filter(|k| k.1 != 0)
+        .collect();
+    kinds.sort_by(|a, b| b.2.cmp(&a.2));
+    let all: u64 = kinds.iter().map(|k| k.2).sum();
+    if all != 0 {
+        let parts: Vec<String> = kinds
+            .iter()
+            .take(16)
+            .map(|&(k, calls, ns)| {
+                format!(
+                    "{} {:.0} calls {:.1} ms {:.0} % ({:.2} us each)",
+                    kind_name(k),
+                    calls as f64 / frames,
+                    ns as f64 / 1e6 / frames,
+                    100.0 * ns as f64 / all as f64,
+                    ns as f64 / 1000.0 / calls as f64
+                )
+            })
+            .collect();
+        tracing::info!("list calls translated by kind, per frame, costliest first: {}", parts.join("; "));
+    }
 }
 
 #[inline]
@@ -405,6 +429,8 @@ macro_rules! plain {
         #[allow(clippy::upper_case_acronyms, non_camel_case_types)]
         #[repr(u64)]
         enum Plain { $($op),* , END }
+        /// The names of [`Plain`]'s ops, by number, for the census by kind.
+        const PLAIN_NAMES: &[&str] = &[$(stringify!($op)),*];
         $(extern "system" fn $name(this: This $(, $a: $t)*) {
             front(this).put(Plain::$op as u64, &[$(Word::word($a)),*]);
         })*
@@ -476,6 +502,28 @@ const TARGETS: u64 = after(13);
 const CLEAR_RTV: u64 = after(14);
 const CLEAR_DSV: u64 = after(15);
 const COPY_TEXTURE: u64 = after(16);
+
+/// The names of the ops after [`Plain`]'s, by `after(n)`.
+const AFTER_NAMES: [&str; 17] = [
+    "RESET", "CLOSE", "UPLOAD", "BARRIER", "BARRIER_GROUPS", "VIEWPORTS", "SCISSORS", "BLEND_FACTOR", "HEAPS",
+    "COMPUTE_CONSTANTS", "GRAPHICS_CONSTANTS", "INDEX_BUFFER", "VERTEX_BUFFERS", "TARGETS", "CLEAR_RTV", "CLEAR_DSV",
+    "COPY_TEXTURE",
+];
+
+/// Room for every op number (they are far fewer).
+const KINDS: usize = 64;
+
+/// Since the last frame line, by op: calls translated and their nanoseconds.
+/// Translation is 4.3 us a call and 182 ms a frame (run 13658), and the
+/// buffer lookups inside it only 14 ms of that: this says which kinds of
+/// call carry the rest.
+static KIND_CALLS: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
+static KIND_NS: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
+
+fn kind_name(op: usize) -> &'static str {
+    let plain = Plain::END as usize;
+    if op < plain { PLAIN_NAMES.get(op).copied().unwrap_or("?") } else { AFTER_NAMES.get(op - plain).copied().unwrap_or("?") }
+}
 
 /// The bytes of `count` things at `items` (none if null).
 fn bytes_of<'a, T>(items: *const T, count: usize) -> &'a [u8] {
@@ -688,10 +736,41 @@ extern "system" fn copy_texture_region_x(
 /// Makes the calls of a stream on `list`: how many, and whether the last one
 /// closed it. Once `left` says so only what must not be lost is done.
 fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool) {
+    // The census by kind: each call's time is from its start to the next
+    // one's, one clock read a call, summed here and given to the counters
+    // once at the end so that four threads do not fight over them a call
+    // at a time.
+    let mut kind_ns = [0u64; KINDS];
+    let mut kind_calls = [0u64; KINDS];
+    let mut last: Option<(usize, std::time::Instant)> = None;
+    let out = translate_counted(list, stream, left, &mut |op| {
+        let now = std::time::Instant::now();
+        if let Some((k, at)) = last {
+            kind_ns[k] += (now - at).as_nanos() as u64;
+        }
+        let k = (op as usize).min(KINDS - 1);
+        kind_calls[k] += 1;
+        last = Some((k, now));
+    });
+    if let Some((k, at)) = last {
+        kind_ns[k] += at.elapsed().as_nanos() as u64;
+    }
+    for k in 0..KINDS {
+        if kind_calls[k] != 0 {
+            KIND_CALLS[k].fetch_add(kind_calls[k], Relaxed);
+            KIND_NS[k].fetch_add(kind_ns[k], Relaxed);
+        }
+    }
+    out
+}
+
+/// [`translate`] itself; `seen` is told each call's op as it begins.
+fn translate_counted(list: This, stream: &[u64], left: impl Fn() -> bool, seen: &mut dyn FnMut(u64)) -> (u64, bool) {
     let (mut i, mut calls, mut closed) = (0, 0, false);
     let mut skip = left();
     while i < stream.len() {
         let (op, len) = (stream[i] & 0xffff, (stream[i] >> 16) as usize);
+        seen(op);
         let w = &stream[i + 1..i + 1 + len];
         i += 1 + len;
         calls += 1;

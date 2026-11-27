@@ -471,6 +471,8 @@ pub(crate) fn queued() -> u64 {
 pub(crate) fn behind_line(frames: f64) {
     if behind::on() {
         crate::list::thin::line(frames);
+        crate::draw::indirect_line(frames);
+        crate::draw::bind_line(frames);
         behind::line(frames);
     }
 }

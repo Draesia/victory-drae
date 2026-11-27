@@ -1220,6 +1220,13 @@ pub(crate) struct HostList {
     /// depends on ([`HostList::changed_something`]); no two lists have the
     /// same.
     epoch: std::sync::atomic::AtomicU64,
+    /// The same, finer ([`HostList::changed_resource`]): by title resource,
+    /// another number each time that resource's state or twin changes in
+    /// this list.
+    resource_gens: Mutex<std::collections::HashMap<usize, u64, std::hash::BuildHasherDefault<AddressHash>>>,
+    /// Another number each time something changes that is not one title
+    /// resource's: a copy, a deferred write, a colour twin settled, a reset.
+    other_gen: std::sync::atomic::AtomicU64,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -4393,6 +4400,8 @@ impl Host {
                 batch_args: Mutex::default(),
                 coming: Mutex::default(),
                 epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
+                resource_gens: Mutex::default(),
+                other_gen: std::sync::atomic::AtomicU64::new(next_epoch()),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes,
@@ -6645,6 +6654,7 @@ impl HostList {
     /// for).
     pub(crate) fn reset(&self) {
         self.changed_something();
+        self.resource_gens.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         let _resetting = crate::timeline::span("resetting a host list");
@@ -6685,6 +6695,39 @@ impl HostList {
     /// refreshed.
     pub(crate) fn changed_something(&self) {
         self.epoch.store(next_epoch(), Ordering::Relaxed);
+        self.other_gen.store(next_epoch(), Ordering::Relaxed);
+    }
+
+    /// [`HostList::changed_something`] that is one title resource's alone (its
+    /// state or its twin): the list's epoch moves as before, and only that
+    /// resource's number among [`HostList::resource_unchanged`]'s. A draw's
+    /// tables then stay as it left them while the resources they show do,
+    /// whatever other textures of the list change meanwhile (`crate::draw`,
+    /// `State::ordinary_tables`).
+    pub(crate) fn changed_resource(&self, resource: crate::object::This) {
+        self.epoch.store(next_epoch(), Ordering::Relaxed);
+        self.resource_gens.lock().unwrap_or_else(|e| e.into_inner()).insert(resource as usize, next_epoch());
+    }
+
+    /// What [`HostList::changed_something`] last made the list's number for
+    /// changes that are no one resource's.
+    pub(crate) fn other_generation(&self) -> u64 {
+        self.other_gen.load(Ordering::Relaxed)
+    }
+
+    /// The numbers of title resources `resources` now (0: never changed in
+    /// this list), into `out`.
+    pub(crate) fn resource_generations(&self, resources: &[usize], out: &mut Vec<u64>) {
+        let gens = self.resource_gens.lock().unwrap_or_else(|e| e.into_inner());
+        out.clear();
+        out.extend(resources.iter().map(|r| gens.get(r).copied().unwrap_or(0)));
+    }
+
+    /// Whether each of `resources` (title resource, its number then) has the
+    /// same number now.
+    pub(crate) fn resources_unchanged(&self, resources: &[(usize, u64)]) -> bool {
+        let gens = self.resource_gens.lock().unwrap_or_else(|e| e.into_inner());
+        resources.iter().all(|&(r, g)| gens.get(&r).copied().unwrap_or(0) == g)
     }
 
     /// See [`HostList::changed_something`].
@@ -6710,13 +6753,13 @@ impl HostList {
         match states.entry(std::sync::Arc::as_ptr(&copy) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
                 v.insert((wanted, wanted, copy));
-                self.changed_something();
+                self.changed_resource(resource);
                 None
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {
                 let before = std::mem::replace(&mut o.get_mut().1, wanted);
                 if before != wanted {
-                    self.changed_something();
+                    self.changed_resource(resource);
                 }
                 (before != wanted).then_some((texture, before))
             }
@@ -6835,7 +6878,7 @@ impl HostList {
             (false, _) => {}
         }
         if was != (u.needs, u.behind, u.writing) || copy || colour {
-            self.changed_something();
+            self.changed_resource(resource);
         }
         // shortcut: the depth plane's twin is not drawn into the plane
         // here: the pass sets a pipeline and a target of ours, which a list
