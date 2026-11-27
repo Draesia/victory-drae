@@ -2600,3 +2600,57 @@ fn a_format_load_read_as_halves_loads_the_integer() {
     }
     assert!(ran > 0, "no SM 6.6 device available");
 }
+
+/// `v_mul_legacy_f32`, `v_mac_legacy_f32` and `v_mad_legacy_f32`: 0 times
+/// anything (an infinity, a NaN) is 0, as in D3D9. Run on the host card as
+/// well as WARP: a driver compiling under fast math may fold the compare and
+/// select the lowering adds into a plain product (0 x inf = NaN), which would
+/// turn the brightest lights black. A zero result may have either sign.
+#[test]
+fn legacy_products_of_zero_and_infinity_are_zero() {
+    let f = f32::to_bits;
+    let (inf, nan) = (f32::INFINITY.to_bits(), 0x7FC0_0000u32);
+    // (v1, v2, v3) -> want
+    let cases: &[([u32; 4], u32)] = &[
+        ([f(2.0), f(3.0), f(1.0), 0], f(6.0)),
+        ([f(0.0), inf, f(1.0), 0], 0),
+        ([inf, f(0.0), f(1.0), 0], 0),
+        ([f(-0.0), inf, f(1.0), 0], 0),
+        ([f(0.0), nan, f(1.0), 0], 0),
+        ([nan, f(0.0), f(1.0), 0], 0),
+        ([f(0.0), f(-1.0e30), f(1.0), 0], 0),
+    ];
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+    let zero_ok = |got: u32, want: u32| {
+        if want & 0x7FFF_FFFF == 0 { got & 0x7FFF_FFFF == 0 } else { got == want }
+    };
+    // v_mul_legacy_f32 v0, v1, v2 (VOP2 0x007 as VOP3 0x107)
+    let mul = build_valu_cs(&vop3(0x107, 0, vgpr(1), vgpr(2), 0));
+    run_cases(&mul, &inputs, |backend, i, inp, got| {
+        assert!(zero_ok(got, cases[i].1), "{backend}: v_mul_legacy_f32({:#010x}, {:#010x}) = {got:#010x}", inp[0], inp[1]);
+    });
+    // v_mad_legacy_f32 v0, v1, v2, v3 (VOP3 0x140): the product, plus 1.0
+    let mad = build_valu_cs(&vop3(0x140, 0, vgpr(1), vgpr(2), vgpr(3)));
+    run_cases(&mad, &inputs, |backend, i, inp, got| {
+        let want = if cases[i].1 == 0 { f(1.0) } else { f(7.0) };
+        assert_eq!(got, want, "{backend}: v_mad_legacy_f32({:#010x}, {:#010x}, 1.0) = {got:#010x}", inp[0], inp[1]);
+    });
+    // v_mov_b32 v0, v3; v_mac_legacy_f32 v0, v1, v2 (VOP2 0x006 as VOP3 0x106)
+    let mut body = vec![vop1(0x001, 0, vgpr(3))];
+    body.extend_from_slice(&vop3(0x106, 0, vgpr(1), vgpr(2), 0));
+    let mac = build_valu_cs(&body);
+    run_cases(&mac, &inputs, |backend, i, inp, got| {
+        let want = if cases[i].1 == 0 { f(1.0) } else { f(7.0) };
+        assert_eq!(got, want, "{backend}: v_mac_legacy_f32({:#010x}, {:#010x}) + 1.0 = {got:#010x}", inp[0], inp[1]);
+    });
+    // In the shape a light takes: v4 = 1/v1 (v_rcp_f32, VOP1 0x02a; inf for
+    // 0), then v_mul_legacy_f32 v0, v4, v2 with v2 = 0.
+    let mut body = vec![vop1(0x02a, 4, vgpr(1))];
+    body.extend_from_slice(&vop3(0x107, 0, vgpr(4), vgpr(2), 0));
+    let rcp = build_valu_cs(&body);
+    let rcp_cases = [[f(0.0), f(0.0), 0, 0], [f(-0.0), f(0.0), 0, 0], [f(0.5), f(3.0), 0, 0]];
+    run_cases(&rcp, &rcp_cases, |backend, i, inp, got| {
+        let want = [0, 0, f(6.0)][i];
+        assert!(zero_ok(got, want), "{backend}: v_mul_legacy_f32(1/{:#010x}, {:#010x}) = {got:#010x}", inp[0], inp[1]);
+    });
+}
