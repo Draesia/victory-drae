@@ -81,6 +81,7 @@ fn build() -> [u8; 32] {
             "VICTORY_NAN_EXACT",
             "VICTORY_PAIRS_FIRST",
             "VICTORY_PAIRED_ONLY",
+            "VICTORY_THREAD_TICKET",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
