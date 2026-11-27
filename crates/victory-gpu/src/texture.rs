@@ -106,6 +106,74 @@ struct Last {
     /// first checks, and after the hash found a change the guard had not
     /// seen ([`hot_textures`]). 0: not checked under the guard yet.
     hot_until: u64,
+    /// With [`live_textures`]: the frame a guarded check last found the
+    /// texture changed after its first filling (0: never).
+    changed_at: u64,
+}
+
+/// Whether a guarded texture is hashed at every check for a while also
+/// after a change the guard *did* see or could not judge
+/// (`VICTORY_TEXTURE_LIVE=1`; off by default; `=verify` also counts on the
+/// frame line).
+///
+/// [`hot_textures`] makes a texture hot again only when the check that
+/// found the change was a blind one: the guard had been asked before and
+/// reported no write since. A check is not blind when what was learnt about
+/// writes was forgotten (`asked` reset: a read through the kernel that
+/// failed with [`no_wait`], a short first filling, a texture looked at for
+/// the first time) or when the guard saw a write to some page of it. A
+/// video's ring of textures found changed on such a check stays cold, and
+/// falls back to being hashed every eighth frame, showing old pictures in
+/// turn. With this switch every change found by a guarded check of a
+/// texture filled before keeps it hot; a first filling does not (a
+/// texture streamed in once does not become hot by it). The idea is
+/// Kitty6's commit 4771364 (from fxceless/victory-gta6 PR #63), on top of
+/// this fork's hot textures.
+fn live_textures() -> Live {
+    static ON: std::sync::OnceLock<Live> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| Live::parse(std::env::var("VICTORY_TEXTURE_LIVE").ok().as_deref()))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Live {
+    Off,
+    On,
+    Verify,
+}
+
+impl Live {
+    fn parse(value: Option<&str>) -> Live {
+        match value.map(str::trim) {
+            Some("1") => Live::On,
+            Some(v) if v.eq_ignore_ascii_case("verify") => Live::Verify,
+            _ => Live::Off,
+        }
+    }
+
+    fn on(self) -> bool {
+        self != Live::Off
+    }
+}
+
+/// Whether a change a refresh found makes the texture hot again (hashed at
+/// every check for [`HOT_FRAMES`]): `blind`, the guard saw no write since
+/// it was last asked; `guarded`, the check went through the guard at all;
+/// `filled_before`, the staging buffer held something before (a first
+/// filling is no change).
+fn rearms(hot: bool, live: Live, guarded: bool, blind: bool, filled_before: bool) -> bool {
+    hot && (blind || (live.on() && guarded && filled_before))
+}
+
+/// Since the last frame line, with `VICTORY_TEXTURE_LIVE=verify`: checks of
+/// guarded textures hashed only because they were hot, of them those that
+/// found a change, textures made hot again that the blind rule alone would
+/// have left cold, and checks passed over unhashed (unwritten, not their
+/// turn, not hot) of a texture found changed within [`HOT_FRAMES`].
+pub(crate) static LIVE_COUNTS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Whether [`LIVE_COUNTS`] are counted.
+pub(crate) fn live_verify() -> bool {
+    live_textures() == Live::Verify
 }
 
 /// Frames a guarded texture is hashed at every check from its first check,
@@ -1284,6 +1352,13 @@ impl Staging {
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         // The guard saw no write: a change the hash finds came another way.
         let mut blind = false;
+        // With `VICTORY_TEXTURE_LIVE`: the check went through the guard,
+        // the staging buffer held something before, and the check hashes
+        // only because the texture is hot (counted with `=verify`).
+        let live = live_textures();
+        let mut guarded = false;
+        let filled_before = last.hash.is_some();
+        let mut hot_only = false;
         if !alone
             && *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
@@ -1302,13 +1377,35 @@ impl Staging {
             }
             let hot = hot_textures() && frame < last.hot_until;
             if unwritten && !turn && !hot {
+                if live == Live::Verify && last.changed_at != 0 && frame < last.changed_at + HOT_FRAMES {
+                    LIVE_COUNTS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 return 0;
             }
             blind = unwritten;
+            guarded = true;
+            hot_only = unwritten && !turn;
+            if live == Live::Verify && hot_only {
+                LIVE_COUNTS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
         }
-        // A change the guard did not see: hashed at every check for a while.
+        // A change the guard did not see: hashed at every check for a while
+        // (with `VICTORY_TEXTURE_LIVE`, any change found under the guard
+        // after the first filling).
         let found_blind = |last: &mut Last| {
-            if blind && hot_textures() {
+            if live.on() && guarded && filled_before {
+                last.changed_at = crate::frame::current();
+                if live == Live::Verify {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    if hot_only {
+                        LIVE_COUNTS[1].fetch_add(1, Relaxed);
+                    }
+                    if !blind && hot_textures() {
+                        LIVE_COUNTS[2].fetch_add(1, Relaxed);
+                    }
+                }
+            }
+            if rearms(hot_textures(), live, guarded, blind, filled_before) {
                 last.hot_until = crate::frame::current() + HOT_FRAMES;
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHot, 1);
@@ -1950,6 +2047,55 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
     });
     map.insert(resource as usize, s.clone());
     Some(s)
+}
+
+#[cfg(test)]
+mod live_tests {
+    use super::{Live, rearms};
+
+    #[test]
+    fn the_switch_reads_one_and_verify_only() {
+        assert_eq!(Live::parse(None), Live::Off);
+        assert_eq!(Live::parse(Some("0")), Live::Off);
+        assert_eq!(Live::parse(Some("")), Live::Off);
+        assert_eq!(Live::parse(Some("yes")), Live::Off);
+        assert_eq!(Live::parse(Some("1")), Live::On);
+        assert_eq!(Live::parse(Some(" 1 ")), Live::On);
+        assert_eq!(Live::parse(Some("verify")), Live::Verify);
+        assert_eq!(Live::parse(Some("VERIFY")), Live::Verify);
+    }
+
+    /// Off, a change makes a texture hot again exactly when it did before:
+    /// hot textures on and the check blind, whatever else holds.
+    #[test]
+    fn off_is_the_blind_rule() {
+        for hot in [false, true] {
+            for guarded in [false, true] {
+                for blind in [false, true] {
+                    for filled in [false, true] {
+                        assert_eq!(rearms(hot, Live::Off, guarded, blind, filled), hot && blind);
+                    }
+                }
+            }
+        }
+    }
+
+    /// On, any change a guarded check finds after the first filling keeps
+    /// the texture hot too; a first filling, an unguarded check, or hot
+    /// textures switched off do not.
+    #[test]
+    fn on_adds_seen_changes_but_not_first_fillings() {
+        for live in [Live::On, Live::Verify] {
+            assert!(rearms(true, live, true, true, true));
+            assert!(rearms(true, live, true, false, true));
+            assert!(!rearms(true, live, true, false, false));
+            assert!(!rearms(true, live, false, false, true));
+            assert!(!rearms(false, live, true, true, true));
+            assert!(!rearms(false, live, true, false, true));
+            // Blind is blind, as before.
+            assert!(rearms(true, live, true, true, false));
+        }
+    }
 }
 
 #[cfg(test)]
