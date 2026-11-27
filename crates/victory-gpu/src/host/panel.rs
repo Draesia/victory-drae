@@ -102,6 +102,7 @@ const fn glyph(c: u8) -> [u8; 7] {
         b'.' => [0, 0, 0, 0, 0, 0b01100, 0b01100],
         b'/' => [0b00001, 0b00010, 0b00010, 0b00100, 0b01000, 0b01000, 0b10000],
         b'-' => [0, 0, 0, 0b11111, 0, 0, 0],
+        b':' => [0, 0b01100, 0b01100, 0, 0b01100, 0b01100, 0],
         b' ' => [0; 7],
         _ => [0b11111, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11111],
     }
@@ -319,6 +320,8 @@ pub(super) struct Panel {
     cost: Duration,
     before: Counters,
     lines: Vec<String>,
+    /// A line of the time-of-day keys ([`super::clock`]), while it is shown.
+    note: Option<String>,
     changed: bool,
     buffers: Option<Buffers>,
     failed: bool,
@@ -335,6 +338,7 @@ impl Panel {
             cost: Duration::ZERO,
             before: Counters::default(),
             lines: Vec::new(),
+            note: None,
             changed: false,
             buffers: None,
             failed: false,
@@ -344,6 +348,11 @@ impl Panel {
     /// A frame was presented; `line`: the counters go back to 0 right behind
     /// this call. (Not shown it asks for the key's state and no more.)
     pub(super) fn frame(&mut self, line: bool) {
+        let note = super::clock::frame();
+        if note != self.note {
+            self.note = note;
+            self.changed = true;
+        }
         if pressed() {
             shown().fetch_xor(true, Ordering::Relaxed);
         }
@@ -386,7 +395,14 @@ impl Panel {
         (width, height): (u32, u32),
         format: DXGI_FORMAT,
     ) {
-        if !shown().load(Ordering::Relaxed) || self.lines.is_empty() || self.failed {
+        // The panel's lines, the time's in place of its last; or the time's alone.
+        let showing: Vec<String> = match (shown().load(Ordering::Relaxed) && !self.lines.is_empty(), &self.note) {
+            (true, Some(note)) => self.lines[..self.lines.len() - 1].iter().cloned().chain([note.clone()]).collect(),
+            (true, None) => self.lines.clone(),
+            (false, Some(note)) => vec![note.clone()],
+            (false, None) => return,
+        };
+        if self.failed {
             return;
         }
         let began = Instant::now();
@@ -404,9 +420,11 @@ impl Panel {
         }
         let Some(buffers) = &mut self.buffers else { return };
         if std::mem::take(&mut self.changed) {
-            buffers.write(&self.lines);
+            buffers.write(&showing);
         }
         let (w, h) = size(scale);
+        // Only as many lines of the box as are shown.
+        let h = h.min((showing.len() as u32 * CELL.1 + 2 * RIM) * scale);
         let list = &list.list;
         // SAFETY: an open list and live resources; the box lies within both.
         unsafe {
@@ -461,7 +479,7 @@ mod tests {
     /// alike.
     #[test]
     fn characters_differ() {
-        let used: Vec<u8> = (b'0'..=b'9').chain(b'A'..=b'Z').chain(*b"./- ").collect();
+        let used: Vec<u8> = (b'0'..=b'9').chain(b'A'..=b'Z').chain(*b"./-: ").collect();
         for (i, a) in used.iter().enumerate() {
             assert_ne!(glyph(*a), glyph(b'#'), "{} has a picture", *a as char);
             assert!(glyph(*a).iter().all(|row| row >> GLYPH.0 == 0));
