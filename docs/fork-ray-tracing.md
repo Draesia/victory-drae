@@ -159,6 +159,7 @@ fork's constant.
 | `VICTORY_AMBIENT=constant:<level>` | the same light everywhere |
 | `VICTORY_AMBIENT_SHADE=<strength>,<metres>` | the creases (1,0.6) |
 | `VICTORY_AMBIENT_AIR=<multiple>` | what the air scatters is bounded by a multiple of the light around (off: the brown veil in the day room stays with it, light-14) |
+| `VICTORY_AMBIENT_WAS=<0..1>` | share of the title's own leftover light the estimate keeps (default 1: all, as before; 0 removes the purple cast night neon leaves through the screen probes) |
 
 It is off while the builder runs.
 
