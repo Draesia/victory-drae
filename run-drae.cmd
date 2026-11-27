@@ -58,6 +58,9 @@ rem   run-corgi.cmd rt-open    as rt, but builder stores DO reach title memory (
 rem   run-corgi.cmd lowram     without VICTORY_CARD_ALL/FETCH_CHECK: SLOWER typical frame (97 vs
 rem                            72 ms) but NO STUTTER (0%% of frames spiked, against 21%%)
 rem   run-corgi.cmd thin0      VICTORY_THIN=0, the value play-highram.ps1 means to set but cannot
+rem   run-corgi.cmd video      intro video plays right: VICTORY_TEXTURE_GUARD=0, JOIN_PARTS=0,
+rem                            TEXTURE_NO_WAIT=0 (the guard misses the video ring, JOIN_PARTS repeats
+rem                            frames, NO_WAIT reads it stale). Textures cost more per frame.
 rem   run-corgi.cmd bar        put title memory windows straight in card memory over the
 rem                            resizable BAR: no CPU-side copy, no send, no change list
 rem   run-corgi.cmd upscaler   WITH the title's own temporal upscaler (VICTORY_OWN_UPSCALER=1). Off by
@@ -169,6 +172,7 @@ set "A_BATCH1="
 set "A_DIAG="
 set "A_LOWRAM="
 set "A_THIN0="
+set "A_VIDEO="
 set "A_SERIESS="
 set "A_NOUPSCALER="
 set "A_UPSCALER="
@@ -182,6 +186,7 @@ if /i "%~1"=="rt-open"  set "A_RT=1"
 if /i "%~1"=="rt-open"  set "A_RTOPEN=1"
 if /i "%~1"=="lowram"   set "A_LOWRAM=1"
 if /i "%~1"=="thin0"    set "A_THIN0=1"
+if /i "%~1"=="video"    set "A_VIDEO=1"
 if /i "%~1"=="series-s"    set "A_SERIESS=1"
 if /i "%~1"=="noupscaler"  set "A_NOUPSCALER=1"
 if /i "%~1"=="upscaler"    set "A_UPSCALER=1"
@@ -290,6 +295,9 @@ rem indirect draws dropped, the water went missing in tiles, and the picture mel
 rem longer you played. THIN=0 costs about 1.5 fps. Pass "thin0" to try it.
 if defined A_THIN0 set "VICTORY_THIN=0"
 
+rem --- intro video fix, on request ("video"): after the block above, so its JOIN_PARTS is overridden.
+if defined A_VIDEO set "VICTORY_TEXTURE_GUARD=0" & set "VICTORY_JOIN_PARTS=0" & set "VICTORY_TEXTURE_NO_WAIT=0"
+
 rem --- the game's real ray-traced indirect light, on request
 if defined A_RT set "VICTORY_BVH_BUILDER=1"
 rem The builder's scans read a per-wave sum with v_readfirstlane in a loop; without this
@@ -309,6 +317,7 @@ if defined A_RT if not defined A_RTOPEN set "TAG=%TAG%-rton"
 if defined A_RTOPEN set "TAG=%TAG%-rtopen"
 if defined A_LOWRAM set "TAG=%TAG%-lowram"
 if defined A_THIN0 set "TAG=%TAG%-thin0"
+if defined A_VIDEO set "TAG=%TAG%-video"
 if defined A_SAFE set "TAG=%TAG%-safe"
 if defined A_NOUPSCALER set "TAG=%TAG%-noupscaler"
 if defined A_SLOTSAUTO set "TAG=%TAG%-slotsauto"
