@@ -5508,6 +5508,24 @@ impl Host {
 
     /// Runs closed lists and waits for them, and with [`late`] for
     /// everything sent to the card before them, which is settled first.
+    /// Runs a closed internal upload-only host list synchronously without
+    /// draining title queues (`queue::before_sync`), so it is deadlock-safe
+    /// from `VICTORY_THIN=1` worker threads (VIctory-NVIDIA).
+    pub(crate) fn execute_sync_internal(&self, list: &HostList) {
+        let _ = self.submit(&[list], &[], false);
+    }
+
+    /// [`Self::present_over`] under its foxhound name (`crate::streamline`'s check).
+    pub(crate) fn present_planes(
+        &self,
+        texture: &ID3D12Resource,
+        state: u32,
+        overlay: Option<(&ID3D12Resource, u32)>,
+        frame: u64,
+    ) -> Option<bool> {
+        self.present_over(texture, state, overlay, frame)
+    }
+
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // Behind what the title's queues were given before it.
         crate::queue::before_sync();
@@ -9601,6 +9619,7 @@ impl Host {
                 }
             }
         }
+        let state_u32 = state;
         let state = D3D12_RESOURCE_STATES(state as i32);
         // SAFETY: our swap chain, list and a live source texture.
         unsafe {
@@ -9696,7 +9715,7 @@ impl Host {
                 frame,
                 crate::streamline::Planes {
                     base: (texture, state_u32),
-                    overlay: overlay.filter(|_| composed),
+                    overlay: over.filter(|_| laid.is_some()),
                     size: [width, height],
                 },
             );
