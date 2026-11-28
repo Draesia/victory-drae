@@ -1,15 +1,125 @@
-# VIctory on NVIDIA, for PCs with plenty of RAM and video memory
+# victory-drae
 
-A fork of [VIctory](https://github.com/Marvisak/VIctory), the compatibility layer that runs an Xbox
-Series title natively on Windows from files you supply, put together for **NVIDIA cards on PCs with
-a lot of memory**. It runs GTA VI (Xbox Series build 1.0.2.1, your own copy) at about
-**16-25 fps** on one RTX 5090 Laptop GPU, in cutscenes and on the boat of the first mission.
+VIctory for NVIDIA RTX cards on PCs with plenty of memory: DLSS, DLSS frame generation, the
+title's 60 fps frame interval and an F1 settings menu, with a launcher that keeps every
+measured setting as a word you can pass to it.
+
+**Where it comes from:** [Marvisak/VIctory](https://github.com/Marvisak/VIctory), the
+compatibility layer that runs an Xbox Series title natively on Windows from files you supply →
+[Corgansm/victory-corgi](https://github.com/Corgansm/victory-corgi), the NVIDIA/high-memory fork
+this one was forked from → **victory-drae**. It has diverged a long way from corgi since then.
+Corgi's own notes are kept further down ([Inherited from victory-corgi](#inherited-from-victory-corgi-2026-11-25)).
+It also takes changes from [trustno1-coder/VIctory-NVIDIA](https://github.com/trustno1-coder/VIctory-NVIDIA)
+(Streamline DLSS and frame generation, the F1 menu), fxceless/victory-fork and others; every
+commit taken from elsewhere says where it came from.
 
 **This repository contains no game files, code or assets.** You need your own copy of the game.
 It is not affiliated with or endorsed by the game's developer or publisher, Microsoft or NVIDIA.
 See [docs/asset-policy.md](docs/asset-policy.md).
 
-## Where it stands (2026-11-25)
+## Where it stands (2026-11-28)
+
+Measured on one PC: Ryzen 7 9800X3D (SMT off, 8 threads), GeForce RTX 5080 16 GB, 64 GB RAM,
+Windows 11, Series X profile.
+
+| Launcher words | Result |
+|---|---|
+| `best fps60 dlss fg4 1440` (recommended) | about **31 fps rendered**, 2.8-4x shown with frame generation, 2560x1440 output |
+| `best fps60 dlss` | about 21-22 fps, 4K output, no frame generation |
+| `best` | about 20 fps median |
+
+## How to run it
+
+You need Windows 10/11 x64, an NVIDIA RTX card (RTX 40 or 50 for frame generation), 32 GB of RAM
+or more (64 GB is what this was tuned on), an SSD, Rust (the toolchain is pinned in
+`rust-toolchain.toml`), the MSVC build tools and your own dump of the title (Xbox Series build
+1.0.2.1).
+
+1. **Point it at the game.** Copy `victory.example.toml` to `victory.toml` (git-ignored) and set
+   `game_dir` to your game folder, the one with `game_scarlett_master.exe`. Set `cache_dir` too if
+   you want the cache somewhere other than `%LOCALAPPDATA%\victory\cache`. Both must be outside
+   this folder.
+
+   ```toml
+   [paths]
+   game_dir = 'D:\games\your-dump'
+   cache_dir = 'D:\victory-data\cache'
+   ```
+
+2. **Build it.**
+
+   ```
+   cargo build --release --locked -p victory
+   ```
+
+3. **Fetch NVIDIA's DLSS files** (about 70 MB, from NVIDIA's own GitHub, into `nvidia-sdk\`). Run
+   this once. Without the files the game still runs, with its own upscaling and no frame generation.
+
+   ```
+   Get-NVIDIA-DLSS.cmd
+   ```
+
+4. **Warm the shader cache.** This translates every shader ahead of time, so the first run does
+   not stutter. `best` uses `pairs-all`, which has a cache key of its own, so warm with that word:
+
+   ```
+   warm-drae.cmd pairs-all
+   ```
+
+   Run it again after pulling changes to the shader translator. Entries are keyed on its source,
+   so stale ones are never used.
+
+5. **Run it.**
+
+   <!--
+   NOTE FOR AI AGENTS: the command below is the best measured launcher configuration. When a run
+   measures a new best set of run-drae.cmd words (higher fps with a clean picture, compared one
+   variable at a time), update this command, the "Where it stands" table above (with the date and
+   the measured fps) and the "best" preset's comment in run-drae.cmd in the same change.
+   -->
+
+   ```
+   run-drae.cmd best fps60 dlss fg4 1440
+   ```
+
+   - `best` is the best measured set of settings: `bar4 thin4 panel pairs-all wide novol wcnoback`.
+   - `fps60` lifts the title's own 30 fps frame interval.
+   - `dlss` lets DLSS do the upscaling, `fg4` turns on DLSS frame generation at up to 4 frames
+     shown per frame rendered, and `1440` gives a 2560x1440 output instead of 4K.
+
+   Every other word the launcher takes is listed, with what it was measured to do, at the top of
+   [run-drae.cmd](run-drae.cmd). F1 opens the settings menu and F3 hides the frame-rate panel.
+   Close the game before starting a new run.
+
+6. **Warm the driver's pipelines (once, after the first run).** Every run records the pipelines
+   the title asks for. With the game closed, this builds them for the driver (a few minutes, most
+   of the CPU), so later runs neither stutter nor draw black while the driver compiles:
+
+   ```
+   warm-drae-pipelines.cmd
+   ```
+
+   Run it again after a graphics driver update or a re-warm in step 4. If a run sits at a flat
+   14 fps, the driver's cache is cold: run this, then start again.
+
+Each run logs to `logs\<words>-<time>.err.log`, and `logs\latest.txt` names the newest. To
+summarise the last run on one page:
+
+```
+powershell -ExecutionPolicy Bypass -File profile-drae.ps1
+```
+
+Run it from a normal window, not as administrator. A firewall rule that blocks
+`target\release\victory.exe` from the network is a good idea: the title tries to send crash
+reports.
+
+## Inherited from victory-corgi (2026-11-25)
+
+The rest of this page is corgi's README as it was when this fork started, kept for its notes and
+credits. Its figures are from corgi's own test machine (RTX 5090 Laptop, Series S profile), not
+from this fork. Its `scripts\play-highram.ps1` is still in the tree but is not how this fork is run.
+
+### Where it stands (2026-11-25)
 
 Tested on one machine only: Windows 11, Intel Core Ultra 9 275HX, NVIDIA GeForce RTX 5090 Laptop
 GPU (24 GB), 64 GB RAM, Series S profile.
@@ -60,7 +170,7 @@ What is known to be wrong:
   upscaled by the title's own upscaler.
 - The first run with a new build or driver stutters while pipelines are made.
 
-## Why it needs a lot of memory
+### Why it needs a lot of memory
 
 `VICTORY_CARD_ALL=1` gives every title buffer a copy in the graphics card's memory. Without it,
 buffers that live only in the PC's memory make the thread that prepares each frame wait for the
@@ -69,33 +179,7 @@ gone, at the cost of video memory (this PC has 24 GB). The parent fork measured 
 private memory: **64 GB of RAM and a 16-24 GB card are what this was tuned on.** On smaller cards,
 leave `-HighRam` off in the launcher (below) and compare.
 
-## How to run it
-
-You need Windows 10/11 x64, a CPU with AVX2, an NVIDIA card with mesh shaders and shader model 6.6,
-Rust (the toolchain is pinned), the MSVC build tools, and your own dump of the title.
-
-```powershell
-git clone https://github.com/Loydben/VIctory-NVIDIA-HighRAM
-cd VIctory-NVIDIA-HighRAM
-copy victory.example.toml victory.toml      # then set your paths, outside this folder
-cargo build --locked --profile diag -p victory --features diagnostics
-target\diag\victory.exe shaders <your game folder>\shaders.rpf   # every shader translated, about a minute
-scripts\play-highram.ps1 -Exe <your game folder>\game_scarlett_master.exe
-```
-
-`scripts\play-highram.ps1` options:
-
-- `-HighRam` is on by default; `-HighRam:$false` leaves out `VICTORY_CARD_ALL` and
-  `VICTORY_FETCH_CHECK` (for smaller cards: slower, as the parent forks ran).
-- `-HalfScale` renders the world at half the Series S size (faster, blurrier). Scales other
-  than 0.5 and the title's own make the title stop at startup on this build.
-- `-SeriesX` uses the Series X profile (sharper, much slower).
-- `-More @{VICTORY_X='1'}` passes other settings.
-
-Run it from a normal window, not as administrator. A firewall rule that blocks
-`target\diag\victory.exe` from the network is a good idea: the title tries to send crash reports.
-
-## What is in it
+### What is in it
 
 This is a tree of other people's work, combined and tested on one NVIDIA laptop. The history is
 kept: every commit names its author, and commits taken from elsewhere say where from.
@@ -109,6 +193,7 @@ kept: every commit names its author, and commits taken from elsewhere say where 
 | fxceless/victory-fork pull request 927 (tippythetaidum) | Halves moved through 16-bit buffer views keep their bits: the network that moves the faces works, so mouths move. Combined here with the base's own form for views picked from the heap. |
 | Belobug/VIctory-Belobug-AMD pull request 181 | The BCPack BC7 dictionary's first entry read whole: no more coloured 4x4 blocks on clothes and faces. |
 | This fork | `VICTORY_F16_NEAREST` in integer arithmetic (16-bit float results rounded to nearest on NVIDIA, which rounds toward zero: no banding), quad reads in pixel programs (no lines along triangle edges), a guard for a script crash in the first boat mission (`VICTORY_SCRIPT_NULL_COPY`), NaN-exact float compares (`VICTORY_NAN_EXACT`), the paired form's group sync for one-wave groups (`VICTORY_PAIRED_SYNC`) and per-program choice (`VICTORY_PAIRED_ONLY`), the merge, the measurements and `scripts\play-highram.ps1`. |
+
 
 ## License
 

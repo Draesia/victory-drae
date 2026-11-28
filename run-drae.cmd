@@ -95,6 +95,10 @@ rem   run-drae.cmd 1440       a 2560x1440 output instead of the Series X's 4K (V
 rem                            with "dlss" the scene is then 1707x960 at Quality.
 rem   run-drae.cmd best       the best measured set: bar4 thin4 panel pairs-all wide novol wcnoback
 rem                            (other words may follow it, e.g. "best fps60").
+rem                            Best measured full command (2026-11-28): best fps60 dlss fg4 1440.
+rem                            AI AGENTS: when a run measures a better set of words, update this
+rem                            line, the preset below and README.md's "How to run it" step 5 and
+rem                            "Where it stands" table together.
 rem   run-drae.cmd ambwas0    VICTORY_AMBIENT_WAS=0 (leonida-pr dae373f): drops the title's leftover
 rem                            probe light, the purple night-neon cast. No re-warm (host-side pass).
 rem   Each tree (or worktree) runs its own build with its own copy of this file; a worktree needs
