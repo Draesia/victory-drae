@@ -82,6 +82,27 @@ fn make(device: &ID3D12Device) -> windows::core::Result<Pass> {
     // shader); plain object creation and queries.
     unsafe {
         let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+        // The static sampler of `RS` as the compiler fills it in, given its
+        // place in the driver's table like the title's (`sampler_order`,
+        // from fxceless/victory-fork 9e90746).
+        crate::pipeline::sampler_order::before(
+            device,
+            &[D3D12_STATIC_SAMPLER_DESC {
+                Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+                AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                AddressW: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+                MipLODBias: 0.0,
+                MaxAnisotropy: 16,
+                ComparisonFunc: D3D12_COMPARISON_FUNC_LESS_EQUAL,
+                BorderColor: D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE,
+                MinLOD: 0.0,
+                MaxLOD: f32::MAX,
+                ShaderRegister: 0,
+                RegisterSpace: 0,
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            }],
+        );
         let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
         let pso: ID3D12PipelineState = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
