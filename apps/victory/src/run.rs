@@ -184,6 +184,16 @@ pub fn run(
     for (name, dll) in &dlls {
         println!("title dll      {name} at {:#x}", dll.base());
         victory_hle::runtime::set_image_path(dll.base(), &title_dir.join(name));
+        // The structure builder's own exports, for its wrappers
+        // (`VICTORY_BVH_HOOK`, `victory_hle::modules::bvh`).
+        #[cfg(windows)]
+        if name.eq_ignore_ascii_case("xboxbvhbuilder.dll") {
+            for export in victory_hle::modules::bvh::WRAPPED {
+                if let Some(address) = dll.export(export) {
+                    victory_hle::modules::bvh::set_original(export, address);
+                }
+            }
+        }
     }
     let imported: Vec<&str> = image
         .info()
@@ -425,7 +435,8 @@ fn poke(base: usize, size: usize) {
 /// DLLs the host or our runtime provide are never taken from the title.
 #[cfg(windows)]
 fn title_dll(host: &victory_hle::HostPolicy, dll: &str) -> bool {
-    !host.allows(dll) && !victory_hle::registry().iter().any(|m| m.serves(dll))
+    // (One we only wrap is the title's still: `victory_hle::wraps`.)
+    !host.allows(dll) && (victory_hle::wraps(dll) || !victory_hle::registry().iter().any(|m| m.serves(dll)))
 }
 
 /// The DLLs among `imported` (the main image's static imports) that must

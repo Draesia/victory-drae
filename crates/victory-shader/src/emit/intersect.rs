@@ -59,6 +59,19 @@ struct Ray {
     inverse: [V; 3],
 }
 
+/// Native ray tracing, `VICTORY_DXR_GUIDED=1` (off by default; with
+/// `VICTORY_DXR=1` at run time, which builds the host structures): a node test
+/// at the root of a structure the host has built is answered by an inline
+/// ray query against the host's structure, as a box node with one child (the
+/// hit instance, or the hit element and its triangle), so the walk goes
+/// straight to the triangle the host found and tests it as the console does;
+/// every other node as before ([`Lower::bvh_guided`]). Part of the
+/// translation's key (`victory-gpu` `shader_cache`).
+pub(crate) fn dxr_guided() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DXR_GUIDED").is_some_and(|v| v == "1"))
+}
+
 /// LOCAL (from our wt5): `VICTORY_BVH_MISS=1` (off by default): the node test
 /// misses every node. While the structure builder is off the structures are
 /// never built, and a walk of what lies in their memory is not the console's.
@@ -143,6 +156,12 @@ impl<'a> Lower<'a> {
             inverse: [f[7], f[8], f[9]],
         };
         let c = self.cur;
+        // The node's absolute pointer, in 8-byte units with its kind in the
+        // low bits: the descriptor's base (dword 0 and the low byte of dword
+        // 1, in 256-byte units) << 5 plus the pointer. (The title's walks use
+        // the 64-bit form with a base of 0 and the structure's address in the
+        // pointer.) Low and high dwords.
+        let mut structure = None;
         let at = match nodes {
             BvhNodes::Resource => {
                 let src = self
@@ -168,6 +187,19 @@ impl<'a> Lower<'a> {
                         .ok_or("an unread operand")?;
                     *w = self.i32_of(v)?;
                 }
+                structure = Some({
+                    let i64t = self.s.m.int(64);
+                    let byte = self.s.m.i32(0xff);
+                    let base_high = self.s.m.bin(c, Bin::And, words[1], byte);
+                    let base = self.join64(words[0], base_high);
+                    let k5 = self.s.m.int_const(i64t, 5);
+                    let base = self.s.m.bin(c, Bin::Shl, base, k5);
+                    let zero = self.s.m.i32(0);
+                    let p = self.join64(pointer, pointer_high.unwrap_or(zero));
+                    let absolute = self.s.m.bin(c, Bin::Add, base, p);
+                    self.s.flags |= flags::INT64;
+                    self.split64(absolute)
+                });
                 let (low, high) = self.bvh_address(words[0], words[1], pointer, pointer_high);
                 // One look for the node's copy, before the branches: a
                 // node is 64 bytes on 64, so its first half lies in one
@@ -181,6 +213,23 @@ impl<'a> Lower<'a> {
                     mapped,
                 }
             }
+        };
+        // The live switch (`VICTORY_RAY_TRACING`, the host's table's last
+        // dword): 0 as translated, 1 the title's own walk only, 2 every node
+        // missed, 3 the host's structures alone ([`Lower::bvh_guided`]). A
+        // host without the table reads 0.
+        let guided = match structure.filter(|_| dxr_guided()) {
+            Some((key, key_high)) => {
+                let (base, table) = self.dxr_table();
+                let c = self.cur;
+                let (undef, align, one) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4), self.s.m.i8(1));
+                let at = self.s.m.i32(crate::emit::DXR_ENTRIES * 16);
+                let r = self.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 139, &[table, at, undef, one, align]);
+                let f = self.s.m.extract(c, r, 0);
+                let mode = self.as_int(f);
+                Some(((key, key_high), base, table, mode))
+            }
+            None => None,
         };
         let zero = self.s.m.i32(0);
         let gate = self.begin_guarded(guard);
@@ -204,6 +253,8 @@ impl<'a> Lower<'a> {
         // triangle miss, so a walk ends at its first node.
         let boxes = if bvh_miss() {
             [self.s.m.i32(bvh::NONE); 4]
+        } else if let Some((key, base, table, mode)) = guided {
+            self.bvh_guided(key, base, table, mode, &ray, |this| this.bvh_boxes(at, kind, &ray, sort))
         } else {
             self.bvh_boxes(at, kind, &ray, sort)
         };
@@ -213,7 +264,18 @@ impl<'a> Lower<'a> {
         let triangle = if bvh_miss() {
             bvh::MISS.map(|f| self.s.m.i32(f.to_bits()))
         } else {
-            self.bvh_triangle(at, kind, &ray)
+            let own = self.bvh_triangle(at, kind, &ray);
+            match guided {
+                // Ray tracing switched off: every triangle missed.
+                Some((.., mode)) => {
+                    let c = self.cur;
+                    let k2 = self.s.m.i32(2);
+                    let off = self.s.m.cmp(c, pred::EQ, mode, k2);
+                    let miss = bvh::MISS.map(|f| self.s.m.i32(f.to_bits()));
+                    std::array::from_fn(|k| self.s.m.select(c, off, miss[k], own[k]))
+                }
+                None => own,
+            }
         };
         let triangle_end = self.cur;
         self.s.m.terminate(triangle_end, Term::Br(join));
@@ -240,6 +302,199 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::V(dst + k as u8), r, guard);
         }
         Ok(())
+    }
+
+    /// A box node test, guided by the host's structures
+    /// ([`dxr_guided`]): `structure` is the descriptor's dword 0, `pointer`
+    /// the node. Looks the structure up in the host's table
+    /// ([`crate::emit::MEMORY_RUN`]); at its root, one ray query against
+    /// its acceleration structure gives the result's one child: for a top
+    /// level the hit instance's node, `((list + 128 * id) >> 3) | 6`; for a
+    /// bottom level the hit element's triangle, `((elements + 64 * (p >> 2))
+    /// >> 3) | (p & 3)`; no hit, no child. Anywhere else `emulated`. Starts
+    /// in the current block and leaves `self.cur` at the block it ends in.
+    #[allow(clippy::too_many_arguments)]
+    fn bvh_guided(
+        &mut self,
+        (structure, structure_high): (V, V),
+        base: V,
+        table: V,
+        mode: V,
+        ray: &Ray,
+        emulated: impl FnOnce(&mut Self) -> [V; 4],
+    ) -> [V; 4] {
+        use crate::emit::{DXR_ENTRIES, DXR_HASH, DXR_TOP, MEMORY_RUN};
+        let c = self.cur;
+        // The entry: the hash's place, then the next three.
+        let (k_hash, k_shift) = (self.s.m.i32(DXR_HASH), self.s.m.i32(crate::emit::DXR_HASH_SHIFT));
+        let hash = self.s.m.bin(c, Bin::Mul, structure, k_hash);
+        let hash = self.s.m.bin(c, Bin::LShr, hash, k_shift);
+        let (undef, align, mask) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4), self.s.m.i8(0xf));
+        let (k_last, k4) = (self.s.m.i32(DXR_ENTRIES - 1), self.s.m.i32(4));
+        let zero = self.s.m.i32(0);
+        let mut found = self.s.m.bool(false);
+        let mut entry = [zero; 4];
+        for n in 0..4u32 {
+            let k = self.s.m.i32(n);
+            let place = self.s.m.bin(c, Bin::Add, hash, k);
+            let place = self.s.m.bin(c, Bin::And, place, k_last);
+            let byte = self.s.m.bin(c, Bin::Shl, place, k4);
+            let r = self.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 139, &[table, byte, undef, mask, align]);
+            let words: Vec<V> = (0..4).map(|k| {
+                let f = self.s.m.extract(c, r, k);
+                self.as_int(f)
+            }).collect();
+            let same_low = self.s.m.cmp(c, pred::EQ, words[0], structure);
+            let same_high = self.s.m.cmp(c, pred::EQ, words[2], structure_high);
+            let same = self.s.m.bin(c, Bin::And, same_low, same_high);
+            let yes = self.s.m.bool(true);
+            let new = self.s.m.bin(c, Bin::Xor, found, yes);
+            let take = self.s.m.bin(c, Bin::And, same, new);
+            for k in 0..4 {
+                entry[k] = self.s.m.select(c, take, words[k], entry[k]);
+            }
+            found = self.s.m.bin(c, Bin::Or, found, take);
+        }
+        // (The key is the root's absolute pointer: found is at the root.)
+        let nonzero = self.s.m.cmp(c, pred::NE, structure, zero);
+        let guided = self.s.m.bin(c, Bin::And, found, nonzero);
+        // (Only with the switch at 0, as translated, or 3, the host's alone.)
+        let as_built = self.s.m.cmp(c, pred::EQ, mode, zero);
+        let k_alone = self.s.m.i32(3);
+        let alone = self.s.m.cmp(c, pred::EQ, mode, k_alone);
+        let as_built = self.s.m.bin(c, Bin::Or, as_built, alone);
+        let guided = self.s.m.bin(c, Bin::And, guided, as_built);
+        let (query_block, emulated_block, join) = (self.s.m.new_block(), self.s.m.new_block(), self.s.m.new_block());
+        self.s.m.terminate(c, Term::CondBr(guided, query_block, emulated_block));
+
+        // The ray query.
+        let q = query_block;
+        let (k30, k_number) = (self.s.m.i32(30), self.s.m.i32(0xffff));
+        let kind = self.s.m.bin(q, Bin::LShr, entry[1], k30);
+        let number = self.s.m.bin(q, Bin::And, entry[1], k_number);
+        let slot = {
+            let k = self.s.m.i32(MEMORY_RUN + 1);
+            let first = self.s.m.bin(q, Bin::Add, base, k);
+            self.s.m.bin(q, Bin::Add, first, number)
+        };
+        let structure_handle = self.s.heap_handle(q, slot, false, true, (16, 0));
+        // RAY_FLAG_FORCE_OPAQUE: alpha-tested triangles count as hit (the
+        // title's own test of them is not run on the way).
+        let opaque = self.s.m.i32(1);
+        let i32t = self.s.t.i32;
+        let query = self.s.op(q, "allocateRayQuery", Attr::NoUnwind, i32t, 178, &[opaque]);
+        let all = self.s.m.i32(0xff);
+        let t_min = self.s.m.f32(0);
+        let void = self.s.t.void;
+        self.s.op(
+            q,
+            "rayQuery_TraceRayInline",
+            Attr::NoUnwind,
+            void,
+            179,
+            &[
+                query,
+                structure_handle,
+                opaque,
+                all,
+                ray.origin[0],
+                ray.origin[1],
+                ray.origin[2],
+                t_min,
+                ray.direction[0],
+                ray.direction[1],
+                ray.direction[2],
+                ray.extent,
+            ],
+        );
+        let i1t = self.s.t.i1;
+        self.s.op(q, "rayQuery_Proceed.i1", Attr::NoUnwind, i1t, 180, &[query]);
+        let status = self.s.op(q, "rayQuery_StateScalar.i32", Attr::ReadOnly, i32t, 184, &[query]);
+        let id = self.s.op(q, "rayQuery_StateScalar.i32", Attr::ReadOnly, i32t, 208, &[query]);
+        let primitive = self.s.op(q, "rayQuery_StateScalar.i32", Attr::ReadOnly, i32t, 210, &[query]);
+        self.s.flags |= flags::RAY_QUERY;
+        let (k1, k2, k3, k6, k7) = (self.s.m.i32(1), self.s.m.i32(2), self.s.m.i32(3), self.s.m.i32(6), self.s.m.i32(7));
+        // A top level's instance node.
+        let record = self.s.m.bin(q, Bin::Shl, id, k7);
+        let instance = self.s.m.bin(q, Bin::Add, entry[3], record);
+        let instance = self.s.m.bin(q, Bin::LShr, instance, k3);
+        let instance = self.s.m.bin(q, Bin::Or, instance, k6);
+        // A bottom level's element, its triangle.
+        let element = self.s.m.bin(q, Bin::LShr, primitive, k2);
+        let k6b = self.s.m.i32(6);
+        let element = self.s.m.bin(q, Bin::Shl, element, k6b);
+        let element = self.s.m.bin(q, Bin::Add, entry[3], element);
+        let element = self.s.m.bin(q, Bin::LShr, element, k3);
+        let triangle = self.s.m.bin(q, Bin::And, primitive, k3);
+        let element = self.s.m.bin(q, Bin::Or, element, triangle);
+        let k_top = self.s.m.i32(DXR_TOP);
+        let top = self.s.m.cmp(q, pred::EQ, kind, k_top);
+        let child = self.s.m.select(q, top, instance, element);
+        let hit = self.s.m.cmp(q, pred::EQ, status, k1);
+        // The counters (`crate::emit::DXR_STRUCTURES`): queries, hits, at a
+        // top level.
+        {
+            let slot = {
+                let k = self.s.m.i32(MEMORY_RUN + 1 + crate::emit::DXR_STRUCTURES);
+                self.s.m.bin(q, Bin::Add, base, k)
+            };
+            let counters = self.s.heap_handle(q, slot, false, false, (11 | 0x1000, 0));
+            let (add, iu, zero_c) = (self.s.m.i32(0), self.s.m.undef(i32t), self.s.m.i32(0));
+            let hits = self.s.m.select(q, hit, k1, zero_c);
+            let tops = self.s.m.select(q, top, k1, zero_c);
+            for (byte, value) in [(0u32, k1), (4, hits), (8, tops)] {
+                let at = self.s.m.i32(byte);
+                self.s.op(q, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[counters, add, at, iu, iu, value]);
+            }
+        }
+        let none = self.s.m.i32(bvh::NONE);
+        // A miss in the host's structure (it may hold only part of the
+        // title's: what is built so far) is not taken for a miss: the
+        // title's own walk of the node instead. But for a bottom level the
+        // host holds whole (`DXR_BOTTOM_WHOLE`): there a miss is one.
+        // With the switch at 3 every miss in the host's structures is one:
+        // what they lack (instances whose bottom level is not built yet, or
+        // not readable) casts no shadow and shows in no reflection. A top
+        // level's miss walked the title's whole tree after the query, and
+        // most rays miss: with the host's top levels holding a third to a
+        // half of a scene's instances, guided walks cost the card more than
+        // the title's alone (run 20261127-161843: 80-170 ms a frame).
+        let k_whole = self.s.m.i32(crate::emit::DXR_BOTTOM_WHOLE);
+        let whole = self.s.m.cmp(q, pred::EQ, kind, k_whole);
+        let answered = self.s.m.bin(q, Bin::Or, hit, whole);
+        let answered = self.s.m.bin(q, Bin::Or, answered, alone);
+        let child = self.s.m.select(q, hit, child, none);
+        let guided = [child, none, none, none];
+        self.s.m.terminate(q, Term::CondBr(answered, join, emulated_block));
+
+        self.cur = emulated_block;
+        let own = emulated(self);
+        let own_end = self.cur;
+        self.s.m.terminate(own_end, Term::Br(join));
+        self.cur = join;
+        let mut out = [zero; 4];
+        // Ray tracing switched off: no child.
+        let k2 = self.s.m.i32(2);
+        let off = self.s.m.cmp(join, pred::EQ, mode, k2);
+        for k in 0..4 {
+            let phi = self.s.m.phi(join, i32t);
+            self.s.m.set_phi(phi, vec![(guided[k], q), (own[k], own_end)]);
+            out[k] = self.s.m.select(join, off, none, phi);
+        }
+        out
+    }
+
+    /// The memory copies' run base and a handle of the host's table of
+    /// structures (`crate::emit::MEMORY_RUN`), in the current block.
+    fn dxr_table(&mut self) -> (V, V) {
+        use crate::emit::{MEMORY_RUN, USER_MEMORY_BASE};
+        use crate::native::RootType;
+        let c = self.cur;
+        let base = self.host_word(RootType::Other(USER_MEMORY_BASE), 0, 0);
+        let k = self.s.m.i32(MEMORY_RUN);
+        let slot = self.s.m.bin(c, Bin::Add, base, k);
+        let table = self.s.heap_handle(c, slot, false, false, (11 | 0x1000, 0));
+        (base, table)
     }
 
     /// Title memory at `low`/`high` for a node's bytes: the raw view of the

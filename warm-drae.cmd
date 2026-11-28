@@ -35,19 +35,25 @@ set "VICTORY_DYNAMIC_SLOTS=524288"
 set "VICTORY_OWN_UPSCALER=1"
 rem "warm-drae.cmd rt" warms for "run-drae.cmd rt" / "rt-open": those two switches are in the
 rem shader cache key, so the rt runs need entries of their own.
-rem Arguments, any order: rt, pairs-all, diag (as in run-drae.cmd).
+rem "warm-drae.cmd dxr" warms for "run-drae.cmd dxr" / "dxr-native" / "dxr-fast" (as rt, plus
+rem VICTORY_DXR_GUIDED=1, also in the key).
+rem Arguments, any order: rt, dxr, pairs-all, diag (as in run-drae.cmd).
 set "W_RT="
+set "W_DXR="
 set "W_PAIRSALL="
 set "W_DIAG="
 :wargs
 if "%~1"=="" goto wargsdone
 if /i "%~1"=="rt" set "W_RT=1"
+if /i "%~1"=="dxr" set "W_RT=1"
+if /i "%~1"=="dxr" set "W_DXR=1"
 if /i "%~1"=="pairs-all" set "W_PAIRSALL=1"
 if /i "%~1"=="diag" set "W_DIAG=1"
 shift
 goto wargs
 :wargsdone
 if defined W_RT (set "VICTORY_FIRSTLANE_OWN=1") else set "VICTORY_BVH_MISS=1"
+if defined W_DXR set "VICTORY_DXR_GUIDED=1"
 set "VICTORY_CARD_BUFFERS_MIN_MB=1"
 set "VICTORY_CARD_BUFFERS_MB=1536"
 set "VICTORY_COMPOSE=1"

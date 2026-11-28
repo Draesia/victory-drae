@@ -53,6 +53,16 @@ pub fn registry() -> &'static [HleModule] {
     &REGISTRY
 }
 
+/// DLLs the title ships that a module only wraps (some exports go through
+/// ours first, which call the DLL's own): still mapped from the title's
+/// folder, and what we do not wrap binds to them.
+const WRAPPED: &[&str] = &["xboxbvhbuilder.dll"];
+
+/// Whether `dll` is one of the title's own that we only wrap.
+pub fn wraps(dll: &str) -> bool {
+    WRAPPED.iter().any(|w| w.eq_ignore_ascii_case(dll))
+}
+
 pub(crate) fn lookup(dll: &str, name: &str) -> Option<usize> {
     registry()
         .iter()

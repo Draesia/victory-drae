@@ -27,6 +27,18 @@ rem                            of title memory (QUARANTINE). Before 27/11 "rt" d
 rem                            builder never started (3 of 53 programs) and BVH_MISS=1 made
 rem                            every ray miss. Needs "warm-drae.cmd rt" (own cache key).
 rem                            upstream corgi README: the builder reset NVIDIA cards within seconds.
+rem   run-drae.cmd dxr        NATIVE RT, guided walk (port of Corgansm/victory-corgi, branch
+rem                            port/native-dxr): as rt, plus VICTORY_DXR=1 (host DXR structures built
+rem                            from the title's) and VICTORY_DXR_GUIDED=1 (each walk asks them first
+rem                            with a RayQuery). Needs "warm-drae.cmd dxr" (own cache key). Upstream
+rem                            measured 80-210 ms a frame of guided work on a 3080 Ti.
+rem   run-drae.cmd dxr-native as dxr, plus VICTORY_BVH_HOOK=1 VICTORY_BVH_NATIVE=all: the layer
+rem                            unpacks and builds the structures itself from the builder DLL's calls
+rem                            (upstream's latest). Same warm as dxr.
+rem   run-drae.cmd dxr-fast   as dxr, plus VICTORY_RAY_TRACING=3: the host structures alone (what they
+rem                            lack casts nothing; lossy). Combine with dxr-native. Same warm as dxr.
+rem   run-drae.cmd bvh-hook   VICTORY_BVH_HOOK=1 alone: log the title's builder calls, change nothing.
+rem                            No ray tracing; normal warm.
 rem   run-drae.cmd pairs-all  VICTORY_PAIRED_ONLY unset: every wave64 program may take the paired form.
 rem                            Needs "warm-drae.cmd pairs-all" (own cache key). See its comment below.
 rem   run-drae.cmd wide       VICTORY_INDIRECT_WIDE=force: indirect dispatches run more than 65,535
@@ -210,12 +222,25 @@ set "A_NOUPSCALER="
 set "A_UPSCALER="
 set "A_BAR="
 set "A_SLOTSAUTO="
+set "A_DXR="
+set "A_DXRNATIVE="
+set "A_DXRFAST="
+set "A_BVHHOOK="
 :args
 if "%~1"=="" goto argsdone
 if /i "%~1"=="safe"     set "A_SAFE=1"
 if /i "%~1"=="rt"       set "A_RT=1"
 if /i "%~1"=="rt-open"  set "A_RT=1"
 if /i "%~1"=="rt-open"  set "A_RTOPEN=1"
+if /i "%~1"=="dxr"        set "A_RT=1"
+if /i "%~1"=="dxr"        set "A_DXR=1"
+if /i "%~1"=="dxr-native" set "A_RT=1"
+if /i "%~1"=="dxr-native" set "A_DXR=1"
+if /i "%~1"=="dxr-native" set "A_DXRNATIVE=1"
+if /i "%~1"=="dxr-fast"   set "A_RT=1"
+if /i "%~1"=="dxr-fast"   set "A_DXR=1"
+if /i "%~1"=="dxr-fast"   set "A_DXRFAST=1"
+if /i "%~1"=="bvh-hook"   set "A_BVHHOOK=1"
 if /i "%~1"=="lowram"   set "A_LOWRAM=1"
 if /i "%~1"=="thin0"    set "A_THIN0=1"
 if /i "%~1"=="series-s"    set "A_SERIESS=1"
@@ -373,6 +398,17 @@ rem Part of the shader cache key.
 if defined A_RT set "VICTORY_FIRSTLANE_OWN=1"
 if defined A_RT if not defined A_RTOPEN set "VICTORY_BVH_QUARANTINE=1"
 
+rem --- native ray tracing (port/native-dxr), on request. Every one is off unless set here.
+rem VICTORY_DXR_GUIDED is part of the shader cache key: warm with "warm-drae.cmd dxr".
+rem VICTORY_RAY_TRACING (3 host structures alone, 2 guided, 1 the title's walk, 0 off) is a
+rem dword of the host's table, read at the start: no warm of its own.
+if defined A_DXR set "VICTORY_DXR=1"
+if defined A_DXR set "VICTORY_DXR_GUIDED=1"
+if defined A_DXRFAST set "VICTORY_RAY_TRACING=3"
+if defined A_DXRNATIVE set "VICTORY_BVH_HOOK=1"
+if defined A_DXRNATIVE set "VICTORY_BVH_NATIVE=all"
+if defined A_BVHHOOK set "VICTORY_BVH_HOOK=1"
+
 rem --- the log of the run. Both streams go to Emu\logs, named after the arguments and the
 rem time, and logs\latest.txt names the newest, which profile-drae.ps1 reads when given no
 rem argument. The console window shows nothing while the title runs; the log has all of it.
@@ -384,6 +420,10 @@ if defined A_SERIESS set "TAG=%TAG%-seriess"
 rem "rton", not "rt": logs named -rt- before 27/11 are runs where ray tracing never ran.
 if defined A_RT if not defined A_RTOPEN set "TAG=%TAG%-rton"
 if defined A_RTOPEN set "TAG=%TAG%-rtopen"
+if defined A_DXR set "TAG=%TAG%-dxr"
+if defined A_DXRNATIVE set "TAG=%TAG%-native"
+if defined A_DXRFAST set "TAG=%TAG%-fast"
+if defined A_BVHHOOK set "TAG=%TAG%-bvhhook"
 if defined A_LOWRAM set "TAG=%TAG%-lowram"
 if defined A_THIN0 set "TAG=%TAG%-thin0"
 if defined A_SAFE set "TAG=%TAG%-safe"

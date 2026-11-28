@@ -64,6 +64,8 @@ fn build() -> [u8; 32] {
         // executable had cached with the switch unset.
         for name in [
             "VICTORY_BVH_MISS",
+            // (Native ray tracing's guided walk, `victory_shader` `intersect`.)
+            "VICTORY_DXR_GUIDED",
             "VICTORY_WAVE_WIDE",
             "VICTORY_WAVE_DEEP_SKIPS",
             "VICTORY_WAVE_OWN_BITS",

@@ -196,6 +196,51 @@ fn run_external(this: This, work: External) {
     });
 }
 
+/// Host work of the layer's own waiting for its place in a list
+/// ([`work_here`]): by id, with the frame it was asked in.
+#[cfg(windows)]
+type HostWork = Box<dyn FnOnce(&crate::host::HostList) + Send>;
+#[cfg(windows)]
+static WORK: std::sync::Mutex<Option<std::collections::HashMap<u64, (u64, HostWork)>>> = std::sync::Mutex::new(None);
+
+/// Records host commands of the layer's own at this place of the title's
+/// list `this` (the native structure builder's passes, `crate::rtas`): at
+/// once on a list that is translated as it is recorded, and by the thread
+/// that translates it when the list only writes its calls down
+/// (`VICTORY_THIN`). `work` may set the compute root signature and the
+/// pipeline: the next draw or dispatch sets its own again. Work whose list
+/// is never run is dropped.
+#[cfg(windows)]
+pub(crate) fn work_here(this: This, work: impl FnOnce(&crate::host::HostList) + Send + 'static) {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let frame = crate::frame::current();
+    {
+        let mut waiting = WORK.lock().unwrap_or_else(|e| e.into_inner());
+        let waiting = waiting.get_or_insert_with(Default::default);
+        if waiting.len() > 4096 {
+            waiting.retain(|_, w| w.0 + 600 > frame);
+        }
+        waiting.insert(id, (frame, Box::new(work)));
+    }
+    if !(thin::on() && thin::work(this, id)) {
+        host_work(this, id);
+    }
+}
+
+/// [`work_here`]'s work `id`, done on the list it was asked for.
+#[cfg(windows)]
+extern "system" fn host_work(this: This, id: u64) {
+    let work = WORK.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|w| w.remove(&id));
+    let Some((_, work)) = work else { return };
+    with_state(this, |list, state| {
+        work(list);
+        // (Upstream's `host_state_replaced`; this tree's `replay` sets
+        // everything the title set again, as for `external`.)
+        state.replay(list);
+    });
+}
+
 /// The submission of `lists` has run: each gives its descriptor tables'
 /// slots back ([`crate::draw::State::tables_done`]). A list cut at waits
 /// keeps them: its state goes with its last part.

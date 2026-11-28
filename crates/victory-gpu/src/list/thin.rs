@@ -480,6 +480,19 @@ plain! {
     WAIT_VALUE wait_value = super::wait_value, (address: u64, comparison: u32, reference: u64);
     WAIT_VALUE64 wait_value64 = super::wait_value64, (address: u64, comparison: u32, reference: u64);
     SYNC sync = super::sync, (flags: u32, control: u32, address: u64, size: u64);
+    HOST_WORK host_work = super::host_work, (id: u64);
+}
+
+/// Work of the layer's own at this place of the title's list
+/// ([`super::work_here`]): `false` if the list is not one that only writes
+/// its calls down (the caller does the work at once).
+pub(crate) fn work(this: This, id: u64) -> bool {
+    let front = front(this);
+    if front.closed || front.recording.is_none() {
+        return false;
+    }
+    host_work(this, id);
+    true
 }
 
 const fn after(n: u64) -> u64 {

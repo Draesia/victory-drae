@@ -1340,7 +1340,22 @@ impl State {
                 addresses.push(self.view_address(compute, u.slot, u.dword));
             }
         }
-        crate::memory::ready(list, heap, &addresses, &written, &constants, use_, t.threads)
+        // (A builder program given the title's geometry descriptions, an SRV
+        // of 48-byte records, `crate::records`: what they point at. Port of
+        // Corgansm/victory-corgi's native DXR.)
+        let geometry: Vec<u64> = if crate::pipeline::is_builder(self.pipeline as This) {
+            t.used
+                .iter()
+                .filter(|u| u.kind == ResourceType::Srv && u.root == RootType::Descriptor && u.stride == crate::records::RECORD as u32)
+                .filter_map(|u| match self.roots_ref(compute).get(usize::from(u.slot)) {
+                    Some(&Root::View(address)) => Some(address),
+                    _ => None,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        crate::memory::ready(list, heap, &addresses, &written, &constants, &geometry, use_, t.threads)
     }
 
     /// The bound heap holding `handle`.
@@ -1577,10 +1592,39 @@ impl State {
                 } else {
                     crate::memory::Use::Reads
                 };
+                // (The unpacking programs' inputs, for the native builder,
+                // `VICTORY_REHYDRATE_CAPTURE`.)
+                #[cfg(feature = "diagnostics")]
+                if crate::memory::capture::on() {
+                    let views: Vec<u64> =
+                        self.roots_ref(compute).iter().filter_map(|r| if let Root::View(a) = r { Some(*a) } else { None }).collect();
+                    let constants: Vec<u32> = self
+                        .roots_ref(compute)
+                        .iter()
+                        .filter_map(|r| if let Root::Constants(c) = r { Some(c.clone()) } else { None })
+                        .flatten()
+                        .collect();
+                    crate::memory::capture::dispatch(&stage.shader.hash, crate::frame::current(), &views, &constants);
+                }
                 let Some(ready) = self.memory_ready(list, &t, compute, use_) else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
                     return false;
                 };
+                // Native ray tracing recorded work of its own on the list
+                // (`crate::memory`): this draw's root signature and pipeline
+                // again, before its arguments. (Its pass set the compute root
+                // signature only.)
+                if ready.clobbered {
+                    // SAFETY: an open list, a live root signature and pipeline.
+                    unsafe {
+                        if compute {
+                            l.SetComputeRootSignature(&p.root);
+                        }
+                        l.SetPipelineState(&p.pso);
+                    }
+                    self.host_roots[1] = if compute { p.root.as_raw() as usize } else { 0 };
+                    self.host_pipeline = p.pso.as_raw() as usize;
+                }
                 Some(ready)
             } else {
                 None
@@ -2692,6 +2736,26 @@ impl State {
         });
     }
 
+
+    /// `VICTORY_BUILDER_CAPTURE`: a dispatch of the structure builder, run or
+    /// dropped.
+    #[cfg(feature = "diagnostics")]
+    fn capture_builder(&self, groups: [u32; 3], indirect: bool, ran: bool) {
+        if !crate::memory::builder_capture::on() || !crate::pipeline::is_builder(self.pipeline as This) {
+            return;
+        }
+        let Some((hash, used)) = crate::pipeline::program_of(self.pipeline as This) else { return };
+        let (mut views, mut constants) = (Vec::new(), Vec::new());
+        for (slot, root) in self.compute.iter().enumerate() {
+            match root {
+                Root::View(a) => views.push((slot, *a)),
+                Root::Constants(c) => constants.push((slot, c.clone())),
+                _ => {}
+            }
+        }
+        crate::memory::builder_capture::dispatch(&hash, crate::frame::current(), groups, indirect, ran, &views, &constants, used);
+    }
+
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: u32) {
         // It may write the arguments a window holds clamped.
@@ -2709,6 +2773,7 @@ impl State {
             {
                 crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
                 self.list_dropped_roots([x, y, z]);
+                self.capture_builder([x, y, z], false, false);
             }
             return;
         }
@@ -2746,6 +2811,7 @@ impl State {
         if crate::pipeline::is_builder(self.pipeline as This) {
             crate::capture::op(list as *const _ as usize, || format!("builder {}", p.name));
             self.list_dropped_roots([x, y, z]);
+            self.capture_builder([x, y, z], false, true);
         }
         // Counted in threads: whole groups of them, and the program is told
         // how many of the last one run, where it asks (its `bind` set that to
@@ -4085,6 +4151,8 @@ impl State {
             return false;
         }
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
+            #[cfg(feature = "diagnostics")]
+            self.capture_builder([0, 0, 0], true, false);
             return false;
         }
         const DRAW: u32 = 0;

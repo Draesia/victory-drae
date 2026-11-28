@@ -17,6 +17,12 @@
 
 #[cfg(windows)]
 mod ambient;
+// LOCAL (port of Corgansm/victory-corgi native DXR, 2026-11-28): the title's ray-tracing
+// structures as flat lists, and the builder's geometry descriptions decoded.
+#[allow(dead_code)]
+mod bvh_flat;
+#[allow(dead_code)]
+mod records;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 // The in-game debugger, `VICTORY_DEBUGGER=<folder>` (from victory-corgi).
@@ -71,6 +77,8 @@ pub mod queue;
 pub mod replay;
 pub mod resource;
 pub mod root;
+// The title's calls into its ray-tracing structure builder (`VICTORY_BVH_HOOK`).
+pub mod rtas;
 #[cfg(windows)]
 mod safecopy;
 #[cfg(windows)]
@@ -79,6 +87,9 @@ mod sampler;
 pub mod shader_cache;
 #[cfg(windows)]
 mod memory;
+// Live settings read by the native ray-tracing port (env only here).
+#[cfg(windows)]
+mod live;
 #[cfg(windows)]
 mod shadow;
 #[cfg(windows)]

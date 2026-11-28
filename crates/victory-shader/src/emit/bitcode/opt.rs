@@ -89,6 +89,8 @@ pub(crate) struct Usage {
     pub atomic64: bool,
     /// A 64-bit float, as a result or an operand.
     pub doubles: bool,
+    /// An inline ray query.
+    pub ray_query: bool,
 }
 
 /// What makes two instructions without an effect the same value.
@@ -1101,6 +1103,8 @@ impl Module {
                 let name = name.strip_prefix("dx.op.").unwrap_or(name);
                 if name.starts_with("wave") || name.starts_with("quad") {
                     u.wave_ops = true;
+                } else if name == "allocateRayQuery" || name.starts_with("rayQuery_") {
+                    u.ray_query = true;
                 } else if name == "createHandleFromHeap" {
                     match args.get(2).and_then(|&s| self.int_k(s)) {
                         Some((_, 0)) => u.heap_views = true,

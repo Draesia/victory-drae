@@ -87,6 +87,50 @@ pub const MEMORY_FAULTS: u32 = 4096;
 /// `RootType::Other` code of a user-data dword the host computes: the view
 /// heap slot of the memory copies' views ([`SLOT_MEMORY`]).
 pub const USER_MEMORY_BASE: u32 = 0x100;
+/// Slots of the memory copies' run from its base: the null view and the
+/// copies' views ([`USER_MEMORY_BASE`]). Native ray tracing
+/// (`VICTORY_DXR_GUIDED`) has the next slots: its table of host structures
+/// at `base + MEMORY_RUN` (a raw view of [`DXR_ENTRIES`] entries of four
+/// dwords: the low dword of its root's absolute node pointer, `(address >>
+/// 3) + root` (0: empty; the title's walks use the 64-bit node test with a
+/// base of 0), its kind ([`DXR_TOP`] or [`DXR_BOTTOM`]) << 30 | its
+/// acceleration structure's number, that pointer's high dword, and its
+/// instance list's (top) or
+/// elements' (bottom) byte offset), and the acceleration structures' views
+/// at `base + MEMORY_RUN + 1 + number`, [`DXR_STRUCTURES`] of them.
+pub const MEMORY_RUN: u32 = 1 << 12;
+/// See [`MEMORY_RUN`]. A power of two: an entry's place is the address's
+/// hash, then the next three.
+///
+/// 16,384 of them: a scene has some 900 bottom levels with a key for their
+/// header's root and one for each root their instances start at, and its top
+/// levels. With 1,024 entries most of those found their four places taken and
+/// were not entered (run 20261127-155346: 917 structures, and three walks in
+/// a hundred found the host's: the rest went the title's way).
+pub const DXR_ENTRIES: u32 = 1 << DXR_ENTRIES_LOG2;
+const DXR_ENTRIES_LOG2: u32 = 14;
+/// The table's hash keeps this many of the product's high bits away
+/// ([`DXR_HASH`]).
+pub const DXR_HASH_SHIFT: u32 = 32 - DXR_ENTRIES_LOG2;
+/// See [`MEMORY_RUN`]. After the structures' views, at
+/// `base + MEMORY_RUN + 1 + DXR_STRUCTURES`: the guided walk's counters (a
+/// raw view; dword 0 its queries, 1 those that hit, 2 those at a top level).
+pub const DXR_STRUCTURES: u32 = (1 << 12) - 1;
+/// See [`MEMORY_RUN`]: a top level, its acceleration structure the host's
+/// top level of it (instance `k`'s id the record's number in its list).
+pub const DXR_TOP: u32 = 1;
+/// See [`MEMORY_RUN`]: a bottom level, its acceleration structure a host
+/// top level of one instance of the host's bottom level of it.
+pub const DXR_BOTTOM: u32 = 2;
+/// See [`MEMORY_RUN`]: a bottom level as [`DXR_BOTTOM`] whose host structure
+/// holds every triangle it will ever have (one the title made once): a ray
+/// that misses the host's misses it, and the title's own walk of it is not
+/// run for the miss. (Of the walks that reached a bottom level's root 97 in a
+/// hundred missed, and each then walked the title's tree of it as well.)
+pub const DXR_BOTTOM_WHOLE: u32 = 3;
+/// The multiplier of the table's hash: `key * DXR_HASH >> DXR_HASH_SHIFT`, the key
+/// the root's absolute pointer's low dword ([`MEMORY_RUN`]).
+pub const DXR_HASH: u32 = 0x9E37_79B1;
 /// `RootType::Other` code of a user-data dword the host computes: the low
 /// 32 bits of the title address of the buffer view at dword `dword` of the
 /// descriptor table of root parameter `slot`; [`USER_VIEW_ADDRESS`] + 1:
@@ -132,6 +176,8 @@ pub(crate) mod flags {
     pub const ATOMIC_HEAP64: u64 = 1 << 32;
     pub const RESOURCE_HEAP: u64 = 1 << 30;
     pub const SAMPLER_HEAP: u64 = 1 << 31;
+    /// Inline ray queries (ray tracing tier 1.1).
+    pub const RAY_QUERY: u64 = 1 << 25;
 }
 
 pub(crate) struct Types {
@@ -595,6 +641,7 @@ impl Shader {
                 (flags::RESOURCE_HEAP, used.heap_views),
                 (flags::SAMPLER_HEAP, used.heap_samplers),
                 (flags::ATOMIC_TYPED64 | flags::ATOMIC_HEAP64, used.atomic64),
+                (flags::RAY_QUERY, used.ray_query),
             ] {
                 if !used {
                     self.flags &= !flag;
@@ -954,6 +1001,10 @@ impl Shader {
         }
         if self.flags & flags::ATOMIC_HEAP64 != 0 {
             features |= 0x1000_0000;
+        }
+        // (Ray tracing tier 1.1.)
+        if self.flags & flags::RAY_QUERY != 0 {
+            features |= 0x10_0000;
         }
         let sfi0 = features.to_le_bytes();
         let isg1 = container::signature(&self.inputs, true);
