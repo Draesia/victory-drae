@@ -1,18 +1,16 @@
 @echo off
-rem Translates every shader into victory-corgi's own shader cache ahead of a run, so the game does
+rem Translates every shader into victory-drae's own shader cache ahead of a run, so the game does
 rem not translate them while you play. A couple of minutes, CPU only.
 rem
-rem Uses corgi's `shaders` command, which opens the GPU itself, so wave size and descriptor limits
+rem Uses victory's `shaders` command, which opens the GPU itself, so wave size and descriptor limits
 rem match a real run; the earlier copy of this file used victory-fork's `translate --warm` and read
 rem its switches out of run-victory.cmd, which is a different fork.
 rem
-rem The settings below are copied from run-corgi.cmd and must be kept in step with it: some are part
+rem The settings below are copied from run-drae.cmd and must be kept in step with it: some are part
 rem of the shader cache key, and entries warmed under different ones are never found at run time.
-rem Re-run after updating corgi (the cache is keyed on the translator's source). The diag build has a
+rem Re-run after updating the tree (the cache is keyed on the translator's source). The diag build has a
 rem SEPARATE cache: warm that with target\diag\victory.exe shaders.
 setlocal EnableExtensions
-set "VICTORY_GAME_DIR=C:\Users\drae\Desktop\GTAVI\GTA6.Xbox.v1.0.2.1-CYBERLEEK"
-set "VICTORY_CACHE_DIR=C:\Users\drae\AppData\Local\VIctory\cache-corgi"
 set "VICTORY_TEXTURE_NO_WAIT=1"
 set "VICTORY_RELAY=2"
 set "VICTORY_WIDE_BACK=1"
@@ -35,9 +33,9 @@ set "VICTORY_UPLOAD_AHEAD=1"
 set "VICTORY_PIPELINE_WAIT_MS=10000"
 set "VICTORY_DYNAMIC_SLOTS=524288"
 set "VICTORY_OWN_UPSCALER=1"
-rem "warm-corgi.cmd rt" warms for "run-corgi.cmd rt" / "rt-open": those two switches are in the
+rem "warm-drae.cmd rt" warms for "run-drae.cmd rt" / "rt-open": those two switches are in the
 rem shader cache key, so the rt runs need entries of their own.
-rem Arguments, any order: rt, pairs-all, diag (as in run-corgi.cmd).
+rem Arguments, any order: rt, pairs-all, diag (as in run-drae.cmd).
 set "W_RT="
 set "W_PAIRSALL="
 set "W_DIAG="
@@ -54,10 +52,14 @@ set "VICTORY_CARD_BUFFERS_MIN_MB=1"
 set "VICTORY_CARD_BUFFERS_MB=1536"
 set "VICTORY_COMPOSE=1"
 rem Both of these are part of the SHADER CACHE KEY (shader_cache.rs:65-83): entries warmed
-rem without them are never found by a run that sets them. Keep in step with run-corgi.cmd.
+rem without them are never found by a run that sets them. Keep in step with run-drae.cmd.
 set "VICTORY_F16_NEAREST=1"
 if not defined W_PAIRSALL set "VICTORY_PAIRED_ONLY=b5b838548eaa4050638308fb2c805641,2431bbe7dc154ad759d20bc954829c1c"
 set "VICTORY_LOG=warn"
+rem Warms the tree this file is in; its victory.toml names the game and cache folders.
+rem DRAE_TREE=<folder> warms another tree's build (e.g. set DRAE_TREE=%~dp0..\victory-leonida).
+if not defined DRAE_TREE set "DRAE_TREE=%~dp0"
+cd /d "%DRAE_TREE%"
 set "EXE=target\release\victory.exe"
 if defined W_DIAG set "EXE=target\diag\victory.exe"
 if not exist "%EXE%" (

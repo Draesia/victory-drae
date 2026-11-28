@@ -84,3 +84,6 @@ logs/**
 # What the F1 menu saved
 /victory-settings.txt
 /victory-settings.*.txt
+/drae-settings.txt
+# run-drae.cmd diag: the in-game debugger's captures
+/debugger/
